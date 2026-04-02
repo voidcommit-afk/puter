@@ -1,5 +1,6 @@
-import { FileReaderPoly } from "./polyfills/fileReaderPoly.js";
-import { showUsageLimitDialog } from "../modules/UsageLimitDialog.js";
+import { FileReaderPoly } from './polyfills/fileReaderPoly.js';
+import { showUsageLimitDialog } from '../modules/UsageLimitDialog.js';
+import { showEmailConfirmationDialog } from '../modules/EmailConfirmationDialog.js';
 
 /**
  * Parses a given response text into a JSON object. If the parsing fails due to invalid JSON format,
@@ -91,6 +92,7 @@ const createDeferred = () => {
 function initXhr (endpoint, APIOrigin, authToken, method = 'post', contentType = 'text/plain;actually=json', responseType = undefined) {
     const xhr = new XMLHttpRequest();
     xhr.open(method, APIOrigin + endpoint, true);
+    xhr.withCredentials = true;
     if ( authToken )
     {
         xhr.setRequestHeader('Authorization', `Bearer ${ authToken}`);
@@ -279,16 +281,18 @@ function make_driver_method (arg_defs, driverInterface, driverName, driverMethod
 async function driverCall (options, driverInterface, driverName, driverMethod, driverArgs, settings) {
     const deferred = createDeferred();
 
-    driverCall_(options,
-                    deferred.resolve,
-                    deferred.reject,
-                    driverInterface,
-                    driverName,
-                    driverMethod,
-                    driverArgs,
-                    undefined,
-                    undefined,
-                    settings);
+    driverCall_(
+        options,
+        deferred.resolve,
+        deferred.reject,
+        driverInterface,
+        driverName,
+        driverMethod,
+        driverArgs,
+        undefined,
+        undefined,
+        settings,
+    );
 
     return await deferred.promise;
 }
@@ -296,8 +300,12 @@ async function driverCall (options, driverInterface, driverName, driverMethod, d
 // This function encapsulates the logic for sending a driver call request
 async function driverCall_ (
     options = {},
-    resolve_func, reject_func,
-    driverInterface, driverName, driverMethod, driverArgs,
+    resolve_func,
+    reject_func,
+    driverInterface,
+    driverName,
+    driverMethod,
+    driverArgs,
     method,
     contentType = 'text/plain;actually=json',
     settings = {},
@@ -392,7 +400,13 @@ async function driverCall_ (
                         if ( lineObject?.error?.code === 'insufficient_funds' || lineObject?.metadata?.usage_limited === true ) {
                             if ( puter.env === 'web' ) {
                                 showUsageLimitDialog('You have reached your usage limit for this account.<br>Please upgrade to continue.');
+                            } else if ( puter.env === 'app' ) {
+                                await puter.ui.requestUpgrade();
                             }
+                        }
+                        // Check for email confirmation required (e.g. AI calls)
+                        if ( lineObject?.error?.code === 'email_must_be_confirmed' && puter.env === 'web' ) {
+                            showEmailConfirmationDialog(lineObject?.error?.message || 'Email confirmation required. Go to Puter.com to confirm your email address.');
                         }
 
                         if ( typeof (lineObject.text) === 'string' ) {
@@ -479,6 +493,13 @@ async function driverCall_ (
 
         if ( (isInsufficientFunds || isUsageLimited) && puter.env === 'web' ) {
             showUsageLimitDialog('Your account has not enough funding to complete this request.<br>Please upgrade to continue.');
+        } else if ( (isInsufficientFunds || isUsageLimited) && puter.env === 'app' ) {
+            await puter.ui.requestUpgrade();
+        }
+
+        // Check for email confirmation required (e.g. AI calls) - web only
+        if ( resp?.error?.code === 'email_must_be_confirmed' && puter.env === 'web' ) {
+            showEmailConfirmationDialog(resp?.error?.message || 'Email confirmation required. Go to Puter.com to confirm your email address.');
         }
 
         // HTTP Error - unauthorized
@@ -611,6 +632,15 @@ function arrayBufferToDataUri (arrayBuffer) {
     });
 }
 
+const VIDEO_EXTENSIONS = ['mp4', 'webm', 'mov', 'mpeg', 'avi', 'mkv', 'm4v', 'ogv'];
+
+const isVideoInput = (url) => {
+    if ( typeof url !== 'string' ) return false;
+    if ( url.startsWith('data:video/') ) return true;
+    const ext = url.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase();
+    return VIDEO_EXTENSIONS.includes(ext);
+};
+
 export {
-    arrayBufferToDataUri, blob_to_url, blobToDataUri, driverCall, handle_error, handle_resp, initXhr, make_driver_method, parseResponse, setupXhrEventHandlers, uuidv4
+    arrayBufferToDataUri, blob_to_url, blobToDataUri, driverCall, handle_error, handle_resp, initXhr, isVideoInput, make_driver_method, parseResponse, setupXhrEventHandlers, uuidv4,
 };

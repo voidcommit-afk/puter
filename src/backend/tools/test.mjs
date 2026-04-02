@@ -23,7 +23,6 @@ import { RuntimeModuleRegistry } from '../src/extension/RuntimeModuleRegistry.js
 import { Kernel } from '../src/Kernel.js';
 import { Core2Module } from '../src/modules/core/Core2Module.js';
 import { Container } from '../src/services/Container.js';
-import { HTTPThumbnailService } from '../src/services/thumbnails/HTTPThumbnailService.js';
 import { consoleLogManager } from '../src/util/consolelog.js';
 import { Context } from '../src/util/context.js';
 import { TestCoreModule } from '../src/modules/test-core/TestCoreModule.js';
@@ -108,7 +107,7 @@ export class TestKernel extends AdvancedBase {
         const root_context = Context.create({
             services,
             useapi: this.useapi,
-            ['runtime-modules']: this.runtimeModuleRegistry,
+            'runtime-modules': this.runtimeModuleRegistry,
             args: {},
         }, 'app');
         this.root_context = root_context;
@@ -136,7 +135,7 @@ export class TestKernel extends AdvancedBase {
                 const mod_context = this._create_mod_context(mod_install_root_context,
                                 {
                                     name: module.constructor.name,
-                                    ['module']: module,
+                                    'module': module,
                                     external: false,
                                 });
                 await this.root_context.arun(async () => {
@@ -193,12 +192,6 @@ const main = async () => {
     for ( const mod of EssentialModules ) {
         k.add_module(new mod());
     }
-    k.add_module({
-        install: async (context) => {
-            const services = context.get('services');
-            services.registerService('thumbs-http', HTTPThumbnailService);
-        },
-    });
     k.boot();
     console.log('awaiting services ready');
     await k.services.ready;

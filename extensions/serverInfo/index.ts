@@ -1,3 +1,8 @@
+/* global config, extension */
+import type {
+    Request,
+    Response,
+} from 'express';
 import fs from 'fs/promises';
 import os from 'os';
 const { Controller, Get, ExtensionController } = extension.import('extensionController');
@@ -5,7 +10,7 @@ const { Controller, Get, ExtensionController } = extension.import('extensionCont
 @Controller('/serverInfo', [...config.allowedUsernames])
 class ServerInfoController extends ExtensionController {
     @Get('', { subdomain: 'api' })
-    async getServerInfo (req, res) {
+    async getServerInfo (_req: Request, res: Response) {
         const osData = {
             platform: os.platform(),
             type: os.type(),

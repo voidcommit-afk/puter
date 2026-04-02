@@ -66,7 +66,6 @@ module.exports = eggspress(['/signup'], {
     const db = req.services.get('database').get(DB_WRITE, 'auth');
     const bcrypt = require('bcrypt');
     const { v4: uuidv4 } = require('uuid');
-    const jwt = require('jsonwebtoken');
     const validator = require('validator');
     let uuid_user;
 
@@ -120,7 +119,7 @@ module.exports = eggspress(['/signup'], {
     await svc_event.emit('puter.signup', event);
 
     if ( ! event.allow ) {
-        return res.status(400).send(event.error ?? 'You are not allowed to sign up.');
+        return res.status(400).send({ message: event.error ?? 'You are not allowed to sign up.', code: 'not_allowed_to_signup' });
     }
 
     // check if user is already logged in
@@ -153,19 +152,19 @@ module.exports = eggspress(['/signup'], {
     const is_user_signup_disabled = await lazy_user_signup();
 
     if ( is_temp_users_disabled && is_user_signup_disabled ) {
-        return res.status(403).send('User signup and Temporary users are disabled.');
+        return res.status(403).send({ message: 'User signup and Temporary users are disabled.', code: 'user_signup_and_temp_users_disabled' });
     }
 
     if ( !req.body.is_temp && is_user_signup_disabled ) {
-        return res.status(403).send('User signup is disabled.');
+        return res.status(403).send({ message: 'User signup is disabled.', code: 'user_signup_disabled' });
     }
 
     if ( req.body.is_temp && is_temp_users_disabled ) {
-        return res.status(403).send('Temporary users are disabled.');
+        return res.status(403).send({ message: 'Temporary users are disabled.', code: 'temp_users_disabled' });
     }
 
     if ( req.body.is_temp && event.no_temp_user ) {
-        return res.status(403).send('You must login or signup.');
+        return res.status(403).send({ message: 'You must login or signup.', code: 'must_login_or_signup' });
     }
 
     // Create temp user data
@@ -260,12 +259,18 @@ module.exports = eggspress(['/signup'], {
         uuid_user = uuid_user[0];
     }
 
-    // email confirmation is required by default unless:
+    // email confirmation is not required by default
+    let email_confirmation_required = 0;
+
     // Pseudo user converting and matching uuid is provided
-    let email_confirmation_required = 1;
     if ( pseudo_user && uuid_user && pseudo_user.id === uuid_user.id )
     {
         email_confirmation_required = 0;
+    }
+
+    // if an extension requires email confirmation, set it to required
+    if ( event.requires_email_confirmation ) {
+        email_confirmation_required = 1;
     }
 
     // -----------------------------------
@@ -296,53 +301,59 @@ module.exports = eggspress(['/signup'], {
     };
 
     if ( pseudo_user === undefined ) {
-        insert_res = await db.write(`INSERT INTO user
+        insert_res = await db.write(
+            `INSERT INTO user
             (
                 username, email, clean_email, password, uuid, referrer, 
                 email_confirm_code, email_confirm_token, free_storage, 
                 referred_by, audit_metadata, signup_ip, signup_ip_forwarded, 
-                signup_user_agent, signup_origin, signup_server
+                signup_user_agent, signup_origin, signup_server, requires_email_confirmation
             ) 
             VALUES 
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
             // username
-            req.body.username,
-            // email
-            req.body.is_temp ? null : req.body.email,
-            // normalized email
-            req.body.is_temp ? null : clean_email,
-            // password
-            req.body.is_temp ? null : await bcrypt.hash(req.body.password, 8),
-            // uuid
-            user_uuid,
-            // referrer
-            req.body.referrer ?? null,
-            // email_confirm_code
-            `${ email_confirm_code}`,
-            // email_confirm_token
-            email_confirm_token,
-            // free_storage
-            config.storage_capacity,
-            // referred_by
-            referred_by_user ? referred_by_user.id : null,
-            // audit_metadata
-            JSON.stringify(audit_metadata),
-            // signup_ip
-            req.connection.remoteAddress ?? null,
-            // signup_ip_fwd
-            req.headers['x-forwarded-for'] ?? null,
-            // signup_user_agent
-            req.headers['user-agent'] ?? null,
-            // signup_origin
-            req.headers['origin'] ?? null,
-            // signup_server
-            config.server_id ?? null,
-        ]);
+                req.body.username,
+                // email
+                req.body.is_temp ? null : req.body.email,
+                // normalized email
+                req.body.is_temp ? null : clean_email,
+                // password
+                req.body.is_temp ? null : await bcrypt.hash(req.body.password, 8),
+                // uuid
+                user_uuid,
+                // referrer
+                req.body.referrer ?? null,
+                // email_confirm_code
+                `${ email_confirm_code}`,
+                // email_confirm_token
+                email_confirm_token,
+                // free_storage
+                config.storage_capacity,
+                // referred_by
+                referred_by_user ? referred_by_user.id : null,
+                // audit_metadata
+                JSON.stringify(audit_metadata),
+                // signup_ip
+                req.connection.remoteAddress ?? null,
+                // signup_ip_fwd
+                req.headers['x-forwarded-for'] ?? null,
+                // signup_user_agent
+                req.headers['user-agent'] ?? null,
+                // signup_origin
+                req.headers['origin'] ?? null,
+                // signup_server
+                config.server_id ?? null,
+                // requires_email_confirmation
+                email_confirmation_required,
+            ],
+        );
 
         // record activity
-        db.write('UPDATE `user` SET `last_activity_ts` = now() WHERE id=? LIMIT 1',
-                        [insert_res.insertId]);
+        db.write(
+            'UPDATE `user` SET `last_activity_ts` = now() WHERE id=? LIMIT 1',
+            [insert_res.insertId],
+        );
 
         // TODO: cache group id
         const svc_group = req.services.get('group');
@@ -351,33 +362,46 @@ module.exports = eggspress(['/signup'], {
                 config.default_temp_group : config.default_user_group,
             users: [req.body.username],
         });
+
+        // send an event for successful signup
+        const svc_event = req.services.get('event');
+        svc_event.emit('puter.signup.success', {
+            user_id: insert_res.insertId,
+            user_uuid: user_uuid,
+            email: req.body.email,
+            username: req.body.username,
+            password: req.body.password,
+            ip: req.headers['x-forwarded-for'] || req.connection.remoteAddress,
+        });
     }
     // -----------------------------------
     // Pseudo User converting
     // -----------------------------------
     else {
-        insert_res = await db.write(`UPDATE user SET
+        insert_res = await db.write(
+            `UPDATE user SET
                 username = ?, password = ?, uuid = ?, email_confirm_code = ?, email_confirm_token = ?, email_confirmed = ?, requires_email_confirmation = 1,
                 referred_by = ?
              WHERE id = ?`,
-        [
+            [
             // username
-            req.body.username,
-            // password
-            await bcrypt.hash(req.body.password, 8),
-            // uuid
-            user_uuid,
-            // email_confirm_code
-            `${ email_confirm_code}`,
-            // email_confirm_token
-            email_confirm_token,
-            // email_confirmed
-            !email_confirmation_required,
-            // id
-            pseudo_user.id,
-            // referred_by
-            referred_by_user ? referred_by_user.id : null,
-        ]);
+                req.body.username,
+                // password
+                await bcrypt.hash(req.body.password, 8),
+                // uuid
+                user_uuid,
+                // email_confirm_code
+                `${ email_confirm_code}`,
+                // email_confirm_token
+                email_confirm_token,
+                // email_confirmed
+                !email_confirmation_required,
+                // id
+                pseudo_user.id,
+                // referred_by
+                referred_by_user ? referred_by_user.id : null,
+            ],
+        );
 
         // TODO: cache group ids
         const svc_group = req.services.get('group');
@@ -399,14 +423,17 @@ module.exports = eggspress(['/signup'], {
     // todo if pseudo user, assign directly no need to do another DB lookup
     const user_id = (pseudo_user === undefined) ? insert_res.insertId : pseudo_user.id;
 
-    const [user] = await db.pread('SELECT * FROM `user` WHERE `id` = ? LIMIT 1',
-                    [user_id]);
+    const [user] = await db.pread(
+        'SELECT * FROM `user` WHERE `id` = ? LIMIT 1',
+        [user_id],
+    );
 
-    // create token for login
-    const { token } = await svc_auth.create_session_token(user, {
+    // create token for login: session token for cookie, GUI token for client
+    const { session, token: session_token } = await svc_auth.create_session_token(user, {
         req,
     });
-        // jwt.sign({uuid: user_uuid}, config.jwt_secret);
+    const gui_token = svc_auth.create_gui_token(user, session);
+    // jwt.sign({uuid: user_uuid}, config.jwt_secret);
 
     //-------------------------------------------------------------
     // email confirmation
@@ -438,8 +465,8 @@ module.exports = eggspress(['/signup'], {
     const svc_user = Context.get('services').get('user');
     await svc_user.generate_default_fsentries({ user });
 
-    //set cookie
-    res.cookie(config.cookie_name, token, {
+    // HTTP-only cookie gets session token (cookie-based requests have hasHttpOnlyCookie)
+    res.cookie(config.cookie_name, session_token, {
         sameSite: 'none',
         secure: true,
         httpOnly: true,
@@ -453,7 +480,7 @@ module.exports = eggspress(['/signup'], {
 
     // return results
     return res.send({
-        token: token,
+        token: gui_token,
         user: {
             username: user.username,
             uuid: user.uuid,

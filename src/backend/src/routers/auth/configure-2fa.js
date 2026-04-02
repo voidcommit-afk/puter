@@ -18,7 +18,7 @@
  */
 const APIError = require('../../api/APIError');
 const eggspress = require('../../api/eggspress');
-const { get_user } = require('../../helpers');
+const { get_user, invalidate_cached_user_by_id } = require('../../helpers');
 const { UserActorType } = require('../../services/auth/Actor');
 const { DB_WRITE } = require('../../services/database/consts');
 const { Context } = require('../../util/context');
@@ -27,7 +27,7 @@ module.exports = eggspress('/auth/configure-2fa/:action', {
     subdomain: 'api',
     auth2: true,
     allowedMethods: ['POST'],
-}, async (req, res, next) => {
+}, async (req, res) => {
     const action = req.params.action;
     const x = Context.get();
 
@@ -73,12 +73,15 @@ module.exports = eggspress('/auth/configure-2fa/:action', {
         });
 
         // update user
-        await db.write('UPDATE user SET otp_secret = ?, otp_recovery_codes = ? WHERE uuid = ?',
-                        [result.secret, hashed_recovery_codes.join(','), user.uuid]);
+        await db.write(
+            'UPDATE user SET otp_secret = ?, otp_recovery_codes = ? WHERE uuid = ?',
+            [result.secret, hashed_recovery_codes.join(','), user.uuid],
+        );
         req.user.otp_secret = result.secret;
         req.user.otp_recovery_codes = hashed_recovery_codes.join(',');
         user.otp_secret = result.secret;
         user.otp_recovery_codes = hashed_recovery_codes.join(',');
+        invalidate_cached_user_by_id(req.user.id);
 
         return result;
     };
@@ -87,7 +90,7 @@ module.exports = eggspress('/auth/configure-2fa/:action', {
     // this should never be used to verify the user's 2FA code
     // for authentication purposes.
     actions.test = async () => {
-        const user = req.user;
+        const user = await get_user({ id: req.user.id, force: true });
         const svc_otp = x.get('services').get('otp');
         const code = req.body.code;
         const ok = svc_otp.verify(user.username, user.otp_secret, code);
@@ -118,8 +121,11 @@ module.exports = eggspress('/auth/configure-2fa/:action', {
             throw APIError.create('2fa_not_configured');
         }
 
-        await db.write('UPDATE user SET otp_enabled = 1 WHERE uuid = ?',
-                        [user.uuid]);
+        await db.write(
+            'UPDATE user SET otp_enabled = 1 WHERE uuid = ?',
+            [user.uuid],
+        );
+        invalidate_cached_user_by_id(req.user.id);
         // update cached user
         req.user.otp_enabled = 1;
 

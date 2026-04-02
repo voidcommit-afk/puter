@@ -20,6 +20,9 @@
 const STUCK_STATUS_TIMEOUT = 10 * 1000;
 const STUCK_ALARM_TIMEOUT = 20 * 1000;
 
+// Temporary limit
+const MAX_DIRECTORY_DEPTH = 35;
+
 import crypto from 'node:crypto';
 import path_ from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
@@ -39,9 +42,6 @@ const svc_acl = extension.import('service:acl');
 // TODO: these services ought to be part of this extension
 const svc_size = extension.import('service:sizeService');
 const svc_resource = extension.import('service:resourceService');
-
-// Not sure where these really belong yet
-const svc_fileCache = extension.import('service:file-cache');
 
 // TODO: depending on mountpoint service will not be necessary
 //       once the storage provider is moved to this extension
@@ -104,6 +104,53 @@ export default class PuterFSProvider {
         this.storageController = storageController;
         this.name = 'puterfs';
     }
+
+    // #region depth limit helpers
+    /**
+     * Number of path segments (directory depth). Root or empty path = 0.
+     * @param {string} path
+     * @returns {number}
+     */
+    #pathDepth (path) {
+        if ( !path || typeof path !== 'string' ) return 0;
+        return path_.normalize(path).split(path_.sep).filter(Boolean).length;
+    }
+
+    /**
+     * Max relative depth of the source tree (0 for a file, 1+ for directory tree).
+     * Used to enforce MAX_DIRECTORY_DEPTH when moving or copying.
+     * @param {FSNode} node
+     * @returns {Promise<number>}
+     */
+    async #getSourceTreeMaxRelativeDepth (node) {
+        await node.fetchEntry();
+        if ( ! node.entry.is_dir ) return 0;
+        const child_uuids = await this.fsEntryController.fast_get_direct_descendants(await node.get('uid'));
+        let max = 0;
+        for ( const child_uuid of child_uuids ) {
+            const child_node = await svc_fs.node(new NodeUIDSelector(child_uuid));
+            const child_relative = 1 + await this.#getSourceTreeMaxRelativeDepth(child_node);
+            max = Math.max(max, child_relative);
+        }
+        return max;
+    }
+
+    /**
+     * Throws if destination depth plus source tree depth would exceed MAX_DIRECTORY_DEPTH.
+     * @param {number} destinationPathDepth
+     * @param {FSNode} sourceNode
+     */
+    async #assertDepthLimitForTreeOp (destinationPathDepth, sourceNode) {
+        const source_relative = await this.#getSourceTreeMaxRelativeDepth(sourceNode);
+        const max_depth = destinationPathDepth + source_relative;
+        if ( max_depth > MAX_DIRECTORY_DEPTH ) {
+            throw APIError.create('directory_depth_limit_exceeded', null, {
+                limit: MAX_DIRECTORY_DEPTH,
+                would_be: max_depth,
+            });
+        }
+    }
+    // #endregion
 
     // TODO: should this be a static member instead?
     get_capabilities () {
@@ -258,14 +305,18 @@ export default class PuterFSProvider {
 
         // shortcut: parent uid + child name
         if ( selector instanceof NodeChildSelector && selector.parent instanceof NodeUIDSelector ) {
-            return await this.fsEntryController.nameExistsUnderParent(selector.parent.uid,
-                            selector.name);
+            return await this.fsEntryController.nameExistsUnderParent(
+                selector.parent.uid,
+                selector.name,
+            );
         }
 
         // shortcut: parent id + child name
         if ( selector instanceof NodeChildSelector && selector.parent instanceof NodeInternalIDSelector ) {
-            return await this.fsEntryController.nameExistsUnderParentID(selector.parent.id,
-                            selector.name);
+            return await this.fsEntryController.nameExistsUnderParentID(
+                selector.parent.id,
+                selector.name,
+            );
         }
 
         return false;
@@ -325,6 +376,14 @@ export default class PuterFSProvider {
             throw APIError.create('subject_does_not_exist');
         }
 
+        const new_path = path_.join(await parent.get('path'), name);
+        if ( this.#pathDepth(new_path) > MAX_DIRECTORY_DEPTH ) {
+            throw APIError.create('directory_depth_limit_exceeded', null, {
+                limit: MAX_DIRECTORY_DEPTH,
+                would_be: this.#pathDepth(new_path),
+            });
+        }
+
         svc_resource.register({
             uid,
             status: RESOURCE_STATUS_PENDING_CREATE,
@@ -346,7 +405,6 @@ export default class PuterFSProvider {
             } : {}),
         };
 
-        console.log('raw fsentry', raw_fsentry);
         const entryOp = await this.fsEntryController.insert(raw_fsentry);
 
         await entryOp.awaitDone();
@@ -473,6 +531,9 @@ export default class PuterFSProvider {
         const timestamp = Math.round(Date.now() / 1000);
         await parent.fetchEntry();
         await source.fetchEntry({ thumbnail: true });
+
+        const destination_path = path_.join(await parent.get('path'), target_name);
+        await this.#assertDepthLimitForTreeOp(this.#pathDepth(destination_path), source);
 
         // New filesystem entry
         const raw_fsentry = {
@@ -603,6 +664,8 @@ export default class PuterFSProvider {
         const old_path = await node.get('path');
         const new_path = path_.join(await new_parent.get('path'), new_name);
 
+        await this.#assertDepthLimitForTreeOp(this.#pathDepth(new_path), node);
+
         const op_update = await this.fsEntryController.update(node.uid, {
             ...(
                 await node.get('parent_uid') !== await new_parent.get('uid')
@@ -648,12 +711,12 @@ export default class PuterFSProvider {
 
     async directory_has_name ({ parent, name }) {
         const uid = await parent.get('uid');
-        /* eslint-disable */
+
         let check_dupe = await db.read(
             'SELECT `id` FROM `fsentries` WHERE `parent_uid` = ? AND name = ? LIMIT 1',
             [uid, name],
         );
-        /* eslint-enable */
+
         return !!check_dupe[0];
     }
 
@@ -751,15 +814,17 @@ export default class PuterFSProvider {
             const store_version_id = storage_resp.VersionId;
             if ( store_version_id ) {
                 // insert version into db
-                db.write('INSERT INTO `fsentry_versions` (`user_id`, `fsentry_id`, `fsentry_uuid`, `version_id`, `message`, `ts_epoch`) VALUES (?, ?, ?, ?, ?, ?)',
-                                [
-                                    actor.type.user.id,
-                                    new_item.id,
-                                    new_item.uuid,
-                                    store_version_id,
-                                    message ?? null,
-                                    timestamp,
-                                ]);
+                db.write(
+                    'INSERT INTO `fsentry_versions` (`user_id`, `fsentry_id`, `fsentry_uuid`, `version_id`, `message`, `ts_epoch`) VALUES (?, ?, ?, ?, ?, ?)',
+                    [
+                        actor.type.user.id,
+                        new_item.id,
+                        new_item.uuid,
+                        store_version_id,
+                        message ?? null,
+                        timestamp,
+                    ],
+                );
             }
         })();
 
@@ -847,12 +912,8 @@ export default class PuterFSProvider {
             svc_resource.free(uid);
         })();
 
-        const cachePromise = (async () => {
-            await svc_fileCache.invalidate(node);
-        })();
-
         (async () => {
-            await Promise.all([entryOpPromise, cachePromise]);
+            await entryOpPromise;
             svc_event.emit('fs.write.file', {
                 node,
                 context,
@@ -865,8 +926,6 @@ export default class PuterFSProvider {
         state_upload.post_insert({
             db, user: actor.type.user, node, uid, message, ts,
         });
-
-        await cachePromise;
 
         return node;
     }
@@ -1005,8 +1064,10 @@ export default class PuterFSProvider {
 
         const userId = await node.get('user_id');
         const fileSize = await node.get('size');
-        svc_size.change_usage(userId,
-                        -1 * fileSize);
+        svc_size.change_usage(
+            userId,
+            -1 * fileSize,
+        );
 
         const ownerActor =  new Actor({
             type: new UserActorType({

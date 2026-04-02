@@ -130,7 +130,7 @@ class DriverService extends BaseService {
         });
     }
 
-    async ['__on_boot.consolidation'] () {
+    async '__on_boot.consolidation' () {
         const svc_registry = this.services.get('registry');
         const svc_event = this.services.get('event');
 
@@ -159,7 +159,7 @@ class DriverService extends BaseService {
     * This method is responsible for registering collections in the service registry.
     * It registers 'interfaces', 'drivers', and 'types' collections.
     */
-    async ['__on_registry.collections'] () {
+    async '__on_registry.collections' () {
         const svc_registry = this.services.get('registry');
         svc_registry.register_collection('interfaces');
         svc_registry.register_collection('drivers');
@@ -170,7 +170,7 @@ class DriverService extends BaseService {
     * It registers 'interfaces', 'drivers', and 'types' collections.
     * It also populates the 'interfaces' collection with default interfaces and registers the collections with the driver service registry.
     */
-    async ['__on_registry.entries'] () {
+    async '__on_registry.entries' () {
         const services = this.services;
         const svc_registry = services.get('registry');
         const col_interfaces = svc_registry.get('interfaces');
@@ -182,18 +182,22 @@ class DriverService extends BaseService {
                 col_types.set(k, types[k]);
             }
         }
-        await services.emit('driver.register.interfaces',
-                        { col_interfaces });
+        await services.emit(
+            'driver.register.interfaces',
+            { col_interfaces },
+        );
 
-        await services.emit('driver.register.drivers',
-                        { col_drivers });
+        await services.emit(
+            'driver.register.drivers',
+            { col_drivers },
+        );
     }
 
     // This is a bit meta: we register the "driver" driver interface.
     // This allows DriverService to be a driver called "driver".
     // The driver drivers allows checking metered usage for drivers,
     // and in the future may provide other driver-related functions.
-    async ['__on_driver.register.interfaces'] () {
+    async '__on_driver.register.interfaces' () {
         const svc_registry = this.services.get('registry');
         const col_interfaces = svc_registry.get('interfaces');
 
@@ -232,7 +236,7 @@ class DriverService extends BaseService {
     get_default_implementation (interface_name) {
         // If there's a hardcoded implementation, use that
         // (^ temporary, until all are migrated)
-        if ( this.interface_to_implementation.hasOwnProperty(interface_name) ) {
+        if ( Object.prototype.hasOwnProperty.call(this.interface_to_implementation, interface_name) ) {
             return this.interface_to_implementation[interface_name];
         }
     }
@@ -251,7 +255,7 @@ class DriverService extends BaseService {
         try {
             return await this._call(o);
         } catch ( e ) {
-            this.log.error(`Driver error response: ${ e.toString()}`);
+            this.log.error(`Driver error response: ${ e.toString().slice(0, 100)}${e.toString().length > 100 ? '...' : ''}`);
             if ( ! (e instanceof APIError) ) {
                 this.errors.report('driver', {
                     source: e,
@@ -283,13 +287,13 @@ class DriverService extends BaseService {
         // parameter. To support outdated clients we use this hard-coded
         // table to map interfaces to default drivers.
         const iface_to_driver = {
-            ['puter-ocr']: 'aws-textract',
-            ['puter-tts']: 'aws-polly',
-            ['puter-speech2speech']: 'elevenlabs-voice-changer',
-            ['puter-speech2txt']: 'openai-speech2txt',
-            ['puter-chat-completion']: 'openai-completion',
-            ['puter-image-generation']: 'openai-image-generation',
-            ['puter-video-generation']: 'openai-video-generation',
+            'puter-ocr': 'aws-textract',
+            'puter-tts': 'aws-polly',
+            'puter-speech2speech': 'elevenlabs-voice-changer',
+            'puter-speech2txt': 'openai-speech2txt',
+            'puter-chat-completion': 'openai-completion',
+            'puter-image-generation': 'openai-image-generation',
+            'puter-video-generation': 'ai-video',
             'puter-apps': 'es:app',
             'puter-subdomains': 'es:subdomain',
             'puter-notifications': 'es:notification',
@@ -414,15 +418,17 @@ class DriverService extends BaseService {
         service,
         service_name,
         iface, method, args,
-        skip_usage,
+        _skip_usage,
     }) {
         if ( ! service ) {
             service = this.services.get(service_name);
         }
 
         const svc_permission = this.services.get('permission');
-        const reading = await svc_permission.scan(actor,
-                        PermissionUtil.join('service', service_name, 'ii', iface));
+        const reading = await svc_permission.scan(
+            actor,
+            PermissionUtil.join('service', service_name, 'ii', iface),
+        );
         const options = PermissionUtil.reading_to_options(reading);
         if ( options.length <= 0 ) {
             throw APIError.create('forbidden');
@@ -480,9 +486,11 @@ class DriverService extends BaseService {
                         const svc_rateLimit = this.services.get('rate-limit');
 
                         await svc_su.sudo(policy_holder, async () => {
-                            await svc_rateLimit.check_and_increment(`V1:${service_name}:${iface}:${method}`,
-                                            effective_policy['rate-limit'].max,
-                                            effective_policy['rate-limit'].period);
+                            await svc_rateLimit.check_and_increment(
+                                `V1:${service_name}:${iface}:${method}`,
+                                effective_policy['rate-limit'].max,
+                                effective_policy['rate-limit'].period,
+                            );
                         });
                         return args;
                     },
@@ -519,7 +527,10 @@ class DriverService extends BaseService {
                                     : method_spec.result.type
                                     ;
                             const svc_coercion = this.services.get('coercion');
-                            result = await svc_coercion.coerce(desired_type, result);
+                            const coerced = await svc_coercion.coerce(desired_type, result);
+                            if ( coerced ) {
+                                result = coerced;
+                            }
                         }
                         return result;
                     },

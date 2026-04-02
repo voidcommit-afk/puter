@@ -1,5 +1,5 @@
 import { createTestKernel } from '../../../tools/test.mjs';
-import helpers from '../../helpers.js';
+import { tmp_provide_services } from '../../helpers.js';
 import AppES from '../../om/entitystorage/AppES';
 import { AppLimitedES } from '../../om/entitystorage/AppLimitedES';
 import { ESBuilder } from '../../om/entitystorage/ESBuilder';
@@ -18,8 +18,22 @@ import { AppIconService } from '../apps/AppIconService';
 import { AppInformationService } from '../apps/AppInformationService';
 import { OldAppNameService } from '../apps/OldAppNameService';
 import AppService from './AppService';
+import config from '../../config.js';
 
 import { describe, expect, it } from 'vitest';
+
+const getHostedIndexUrl = subdomain => {
+    const hostedDomainCandidate = [
+        config.static_hosting_domain_alt,
+        config.static_hosting_domain,
+        config.private_app_hosting_domain_alt,
+        config.private_app_hosting_domain,
+    ].find(domainValue => typeof domainValue === 'string' && domainValue.trim());
+    const hostedDomain = hostedDomainCandidate
+        ? hostedDomainCandidate.trim().toLowerCase().replace(/^\./, '').split(':')[0]
+        : 'site.puter.localhost';
+    return `https://${subdomain}.${hostedDomain}`;
+};
 
 const ES_APP_ARGS = {
     entity: 'app',
@@ -68,7 +82,7 @@ const testWithEachService = async (fnToRunOnBoth, {
 } = {}) => {
     return await fixContextInitialization(async () => {
         const setupUserAndRunWithContext = async (params, fn) => {
-            const { kernel, key } = params;
+            const { kernel } = params;
             const db = kernel.services.get('database').get('write', 'test');
             const userId = 1;
             const username = 'testuser';
@@ -80,8 +94,10 @@ const testWithEachService = async (fnToRunOnBoth, {
                 .read('SELECT * FROM user WHERE uuid = ?', [uuid]);
 
             if ( existingUser.length === 0 ) {
-                await db.write('INSERT INTO user (uuid, username, free_storage) VALUES (?, ?, ?)',
-                                [uuid, username, 1024 * 1024 * 1024]);
+                await db.write(
+                    'INSERT INTO user (uuid, username, free_storage) VALUES (?, ?, ?)',
+                    [uuid, username, 1024 * 1024 * 1024],
+                );
             }
 
             // Read the user back to get the actual id
@@ -124,7 +140,7 @@ const testWithEachService = async (fnToRunOnBoth, {
                 'es:app': ES_APP_ARGS,
             },
         });
-        await helpers.tmp_provide_services(esAppTestKernel.services);
+        await tmp_provide_services(esAppTestKernel.services);
 
         const appTestKernel = await createTestKernel({
             testCore: true,
@@ -137,11 +153,11 @@ const testWithEachService = async (fnToRunOnBoth, {
                 'app': AppService,
             },
         });
-        await helpers.tmp_provide_services(appTestKernel.services);
+        await tmp_provide_services(appTestKernel.services);
 
-        helpers.tmp_provide_services(appTestKernel.services);
+        tmp_provide_services(appTestKernel.services);
         await setupUserAndRunWithContext({ kernel: appTestKernel, key: 'app' }, fnToRunOnBoth);
-        helpers.tmp_provide_services(esAppTestKernel.services);
+        tmp_provide_services(esAppTestKernel.services);
         if ( fnToRunOnTheOther ) {
             await setupUserAndRunWithContext({ kernel: esAppTestKernel, key: 'es:app' }, fnToRunOnTheOther);
         } else {
@@ -179,31 +195,33 @@ describe('AppService Regression Prevention Tests', () => {
         // This should fail because we create apps with different names
         let assertionErrorThrown = false;
         try {
-            await testWithEachService(async ({ kernel, key }) => {
-                const service = kernel.services.get(key);
-                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
-                await crudQ.create.call(service, {
-                    object: {
-                        name: 'test-app',
-                        title: 'Test App',
-                        index_url: 'https://example.com',
-                    },
-                });
-            },
-            {
-                fnToRunOnTheOther: async ({ kernel, key }) => {
+            await testWithEachService(
+                async ({ kernel, key }) => {
                     const service = kernel.services.get(key);
                     const crudQ = service.constructor.IMPLEMENTS['crud-q'];
-                    // Create app with DIFFERENT name to cause deviation
                     await crudQ.create.call(service, {
                         object: {
-                            name: 'different-app', // Different name!
-                            title: 'Different Test App',
+                            name: 'test-app',
+                            title: 'Test App',
                             index_url: 'https://example.com',
                         },
                     });
                 },
-            });
+                {
+                    fnToRunOnTheOther: async ({ kernel, key }) => {
+                        const service = kernel.services.get(key);
+                        const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                        // Create app with DIFFERENT name to cause deviation
+                        await crudQ.create.call(service, {
+                            object: {
+                                name: 'different-app', // Different name!
+                                title: 'Different Test App',
+                                index_url: 'https://example.com',
+                            },
+                        });
+                    },
+                },
+            );
         } catch ( error ) {
             // Vitest assertion errors are thrown when expect() fails
             // Check if it's an AssertionError or has assertion-related properties
@@ -387,7 +405,8 @@ describe('AppService Regression Prevention Tests', () => {
                 const read = await crudQ.read.call(service, { uid: created.uid });
                 expect(read.title).toBe('Filetype App Updated');
                 expect(read.filetype_associations).toEqual(
-                                expect.arrayContaining(['txt', 'md', 'json']));
+                    expect.arrayContaining(['txt', 'md', 'json']),
+                );
             });
         });
 
@@ -401,7 +420,7 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'taken-name',
                         title: 'First App',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/taken-name',
                     },
                 });
 
@@ -409,7 +428,7 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'second-app',
                         title: 'Second App',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/second-app',
                     },
                 });
 
@@ -520,21 +539,21 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'select-app-1',
                         title: 'Select App 1',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/select-app-1',
                     },
                 });
                 await crudQ.create.call(service, {
                     object: {
                         name: 'select-app-2',
                         title: 'Select App 2',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/select-app-2',
                     },
                 });
                 await crudQ.create.call(service, {
                     object: {
                         name: 'select-app-3',
                         title: 'Select App 3',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/select-app-3',
                     },
                 });
 
@@ -683,7 +702,7 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'conflict-name',
                         title: 'First App',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/conflict-name-1',
                     },
                 });
 
@@ -694,13 +713,367 @@ describe('AppService Regression Prevention Tests', () => {
                         object: {
                             name: 'conflict-name',
                             title: 'Second App',
-                            index_url: 'https://example.com',
+                            index_url: 'https://example.com/conflict-name-2',
                         },
                     });
                 } catch ( error ) {
                     errorThrown = true;
                     const code = error.fields?.code || error.code;
                     expect(code).toBe('app_name_already_in_use');
+                }
+                expect(errorThrown).toBe(true);
+            });
+        });
+
+        it('should allow duplicate dev-center placeholder index_url', async () => {
+            await testWithEachService(async ({ kernel, key }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+
+                await crudQ.create.call(service, {
+                    object: {
+                        name: 'placeholder-app-1',
+                        title: 'Placeholder App 1',
+                        index_url: 'https://dev-center.puter.com/coming-soon.html',
+                    },
+                });
+
+                const second = await crudQ.create.call(service, {
+                    object: {
+                        name: 'placeholder-app-2',
+                        title: 'Placeholder App 2',
+                        index_url: 'https://dev-center.puter.com/coming-soon.html',
+                    },
+                });
+
+                expect(second.uid).toBeDefined();
+            });
+        });
+
+        it('should allow duplicate non-hosted index_url', async () => {
+            await testWithEachService(async ({ kernel, key }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+
+                const first = await crudQ.create.call(service, {
+                    object: {
+                        name: 'non-hosted-duplicate-1',
+                        title: 'Non Hosted Duplicate 1',
+                        index_url: 'https://example.com/shared-origin',
+                    },
+                });
+
+                const second = await crudQ.create.call(service, {
+                    object: {
+                        name: 'non-hosted-duplicate-2',
+                        title: 'Non Hosted Duplicate 2',
+                        index_url: 'https://example.com/shared-origin',
+                    },
+                });
+
+                expect(first.uid).toBeDefined();
+                expect(second.uid).toBeDefined();
+                expect(second.uid).not.toBe(first.uid);
+            });
+        });
+
+        it('should join existing unowned hosted index_url app on create', async () => {
+            await testWithEachService(async ({ kernel, key, user }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                const db = kernel.services.get('database').get('write', 'test');
+                const hostedIndexUrl = getHostedIndexUrl('joinable-site');
+                const existingUid = 'app-11111111-1111-4111-8111-111111111111';
+
+                kernel.services.set('puter-site', {
+                    get_subdomain: async (subdomain) => {
+                        const rows = await db.read(
+                            'SELECT * FROM subdomains WHERE subdomain = ? LIMIT 1',
+                            [subdomain],
+                        );
+                        return rows[0] || null;
+                    },
+                });
+
+                await db.write(
+                    'INSERT INTO subdomains (uuid, subdomain, user_id, root_dir_id) VALUES (?, ?, ?, ?)',
+                    ['sd-11111111-1111-4111-8111-111111111111', 'joinable-site', user.id, 111],
+                );
+                await db.write(
+                    'INSERT INTO apps (uid, name, title, description, index_url, owner_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    [existingUid, 'joinable-existing-app', 'Joinable Existing App', 'Created from origin', hostedIndexUrl, null],
+                );
+
+                const joined = await crudQ.create.call(service, {
+                    object: {
+                        name: 'joinable-hosted-app',
+                        title: 'Joinable Hosted App',
+                        description: 'Claimed by owner',
+                        index_url: hostedIndexUrl,
+                    },
+                });
+
+                expect(joined.uid).toBe(existingUid);
+
+                const joinedRows = await db.read(
+                    'SELECT uid, name, owner_user_id FROM apps WHERE index_url = ?',
+                    [hostedIndexUrl],
+                );
+                expect(joinedRows).toHaveLength(1);
+                expect(joinedRows[0].uid).toBe(existingUid);
+                expect(joinedRows[0].name).toBe('joinable-hosted-app');
+                expect(joinedRows[0].owner_user_id).toBe(user.id);
+            });
+        });
+
+        it('should join existing unowned hosted index_url app on update', async () => {
+            await testWithEachService(async ({ kernel, key, user }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                const db = kernel.services.get('database').get('write', 'test');
+                const hostedIndexUrl = getHostedIndexUrl('joinable-update-site');
+                const existingUid = 'app-33333333-3333-4333-8333-333333333333';
+
+                kernel.services.set('puter-site', {
+                    get_subdomain: async (subdomain) => {
+                        const rows = await db.read(
+                            'SELECT * FROM subdomains WHERE subdomain = ? LIMIT 1',
+                            [subdomain],
+                        );
+                        return rows[0] || null;
+                    },
+                });
+
+                await db.write(
+                    'INSERT INTO subdomains (uuid, subdomain, user_id, root_dir_id) VALUES (?, ?, ?, ?)',
+                    ['sd-33333333-3333-4333-8333-333333333333', 'joinable-update-site', user.id, 333],
+                );
+                await db.write(
+                    'INSERT INTO apps (uid, name, title, description, index_url, owner_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    [existingUid, 'joinable-update-existing', 'Joinable Update Existing', 'Auto-created app', hostedIndexUrl, null],
+                );
+
+                const appToUpdate = await crudQ.create.call(service, {
+                    object: {
+                        name: 'joinable-update-source',
+                        title: 'Joinable Update Source',
+                        description: 'Source app to be merged',
+                        index_url: 'https://example.com/update-source',
+                    },
+                });
+
+                const joined = await crudQ.update.call(service, {
+                    object: {
+                        uid: appToUpdate.uid,
+                        name: 'joinable-update-merged',
+                        title: 'Joinable Update Merged',
+                        description: 'Merged by owner',
+                        index_url: hostedIndexUrl,
+                    },
+                });
+
+                expect(joined.uid).toBe(existingUid);
+
+                const joinedRows = await db.read(
+                    'SELECT uid, name, title, owner_user_id FROM apps WHERE index_url = ?',
+                    [hostedIndexUrl],
+                );
+                expect(joinedRows).toHaveLength(1);
+                expect(joinedRows[0].uid).toBe(existingUid);
+                expect(joinedRows[0].name).toBe('joinable-update-merged');
+                expect(joinedRows[0].title).toBe('Joinable Update Merged');
+                expect(joinedRows[0].owner_user_id).toBe(user.id);
+
+                const sourceRows = await db.read(
+                    'SELECT uid FROM apps WHERE uid = ?',
+                    [appToUpdate.uid],
+                );
+                expect(sourceRows).toHaveLength(0);
+
+                const aliasedRead = await crudQ.read.call(service, {
+                    uid: appToUpdate.uid,
+                });
+                expect(aliasedRead.uid).toBe(existingUid);
+            });
+        });
+
+        it('should join on update when name matches source app name', async () => {
+            await testWithEachService(async ({ kernel, key, user }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                const db = kernel.services.get('database').get('write', 'test');
+                const hostedIndexUrl = getHostedIndexUrl('joinable-update-self-name');
+                const existingUid = 'app-44444444-4444-4444-8444-444444444444';
+
+                kernel.services.set('puter-site', {
+                    get_subdomain: async (subdomain) => {
+                        const rows = await db.read(
+                            'SELECT * FROM subdomains WHERE subdomain = ? LIMIT 1',
+                            [subdomain],
+                        );
+                        return rows[0] || null;
+                    },
+                });
+
+                await db.write(
+                    'INSERT INTO subdomains (uuid, subdomain, user_id, root_dir_id) VALUES (?, ?, ?, ?)',
+                    ['sd-44444444-4444-4444-8444-444444444444', 'joinable-update-self-name', user.id, 444],
+                );
+                await db.write(
+                    'INSERT INTO apps (uid, name, title, description, index_url, owner_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    [existingUid, 'existing-target-name', 'Existing Target', 'Auto-created app', hostedIndexUrl, null],
+                );
+
+                const source = await crudQ.create.call(service, {
+                    object: {
+                        name: 'staging-app-center',
+                        title: 'Source App',
+                        description: 'Source app before join',
+                        index_url: 'https://example.com/staging-source',
+                    },
+                });
+
+                const joined = await crudQ.update.call(service, {
+                    object: {
+                        uid: source.uid,
+                        name: 'staging-app-center',
+                        title: 'Merged Title',
+                        index_url: hostedIndexUrl,
+                    },
+                });
+
+                expect(joined.uid).toBe(existingUid);
+
+                const targetRows = await db.read(
+                    'SELECT uid, name, title FROM apps WHERE uid = ?',
+                    [existingUid],
+                );
+                expect(targetRows).toHaveLength(1);
+                expect(targetRows[0].name).toBe('staging-app-center');
+                expect(targetRows[0].title).toBe('Merged Title');
+
+                const sourceRows = await db.read(
+                    'SELECT uid FROM apps WHERE uid = ?',
+                    [source.uid],
+                );
+                expect(sourceRows).toHaveLength(0);
+
+                const aliasedRead = await crudQ.read.call(service, {
+                    uid: source.uid,
+                });
+                expect(aliasedRead.uid).toBe(existingUid);
+            });
+        });
+
+        it('should join owned bootstrap hosted app on update', async () => {
+            await testWithEachService(async ({ kernel, key, user }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                const db = kernel.services.get('database').get('write', 'test');
+                const hostedIndexUrl = getHostedIndexUrl('joinable-owned-bootstrap');
+                const existingUid = 'app-55555555-5555-4555-8555-555555555555';
+
+                kernel.services.set('puter-site', {
+                    get_subdomain: async (subdomain) => {
+                        const rows = await db.read(
+                            'SELECT * FROM subdomains WHERE subdomain = ? LIMIT 1',
+                            [subdomain],
+                        );
+                        return rows[0] || null;
+                    },
+                });
+
+                await db.write(
+                    'INSERT INTO subdomains (uuid, subdomain, user_id, root_dir_id) VALUES (?, ?, ?, ?)',
+                    ['sd-55555555-5555-4555-8555-555555555555', 'joinable-owned-bootstrap', user.id, 555],
+                );
+                await db.write(
+                    'INSERT INTO apps (uid, name, title, description, index_url, owner_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    [
+                        existingUid,
+                        existingUid,
+                        existingUid,
+                        `App created from origin ${hostedIndexUrl}`,
+                        hostedIndexUrl,
+                        user.id,
+                    ],
+                );
+
+                const source = await crudQ.create.call(service, {
+                    object: {
+                        name: 'owned-bootstrap-source',
+                        title: 'Owned Bootstrap Source',
+                        description: 'Source app to be merged',
+                        index_url: 'https://example.com/owned-bootstrap-source',
+                    },
+                });
+
+                const joined = await crudQ.update.call(service, {
+                    object: {
+                        uid: source.uid,
+                        title: 'Merged Bootstrap Title',
+                        index_url: hostedIndexUrl,
+                    },
+                });
+
+                expect(joined.uid).toBe(existingUid);
+
+                const targetRows = await db.read(
+                    'SELECT uid, title, owner_user_id FROM apps WHERE uid = ?',
+                    [existingUid],
+                );
+                expect(targetRows).toHaveLength(1);
+                expect(targetRows[0].title).toBe('Merged Bootstrap Title');
+                expect(targetRows[0].owner_user_id).toBe(user.id);
+            });
+        });
+
+        it('should reject hosted duplicate index_url owned by another user', async () => {
+            await testWithEachService(async ({ kernel, key, user }) => {
+                const service = kernel.services.get(key);
+                const crudQ = service.constructor.IMPLEMENTS['crud-q'];
+                const db = kernel.services.get('database').get('write', 'test');
+                const hostedIndexUrl = getHostedIndexUrl('foreign-owned');
+
+                kernel.services.set('puter-site', {
+                    get_subdomain: async (subdomain) => {
+                        const rows = await db.read(
+                            'SELECT * FROM subdomains WHERE subdomain = ? LIMIT 1',
+                            [subdomain],
+                        );
+                        return rows[0] || null;
+                    },
+                });
+
+                await db.write(
+                    'INSERT INTO user (uuid, username, free_storage) VALUES (?, ?, ?)',
+                    ['user-uuid-2', 'otheruser', 1024 * 1024 * 1024],
+                );
+                const otherUsers = await db.read('SELECT id FROM user WHERE uuid = ?', ['user-uuid-2']);
+                const otherUserId = otherUsers[0].id;
+
+                await db.write(
+                    'INSERT INTO subdomains (uuid, subdomain, user_id, root_dir_id) VALUES (?, ?, ?, ?)',
+                    ['sd-22222222-2222-4222-8222-222222222222', 'foreign-owned', user.id, 222],
+                );
+                await db.write(
+                    'INSERT INTO apps (uid, name, title, description, index_url, owner_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                    ['app-22222222-2222-4222-8222-222222222222', 'foreign-owned-existing', 'Foreign Owned Existing', 'Owned by another user', hostedIndexUrl, otherUserId],
+                );
+
+                let errorThrown = false;
+                try {
+                    await crudQ.create.call(service, {
+                        object: {
+                            name: 'foreign-owned-new',
+                            title: 'Foreign Owned New',
+                            index_url: hostedIndexUrl,
+                        },
+                    });
+                } catch ( error ) {
+                    errorThrown = true;
+                    const code = error.fields?.code || error.code;
+                    expect(code).toBe('app_index_url_already_in_use');
                 }
                 expect(errorThrown).toBe(true);
             });
@@ -716,7 +1089,7 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'dedupe-name',
                         title: 'First App',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/dedupe-name-1',
                     },
                 });
 
@@ -725,7 +1098,7 @@ describe('AppService Regression Prevention Tests', () => {
                     object: {
                         name: 'dedupe-name',
                         title: 'Second App',
-                        index_url: 'https://example.com',
+                        index_url: 'https://example.com/dedupe-name-2',
                     },
                     options: { dedupe_name: true },
                 });

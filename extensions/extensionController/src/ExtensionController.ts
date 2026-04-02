@@ -1,10 +1,11 @@
-import type { RequestHandler } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { StatusCodes } from 'http-status-codes';
 import type {
     EndpointOptions,
     HttpMethod,
     RouterMethods,
 } from '../../api.d.ts';
+declare const extension: Partial<Record<HttpMethod, RouterMethods[HttpMethod]>>;
 /**
  * Class decorator to set prefix on prototype and register routes on instantiation
  * @argument prefix - prefix for all routes under the class
@@ -31,7 +32,7 @@ interface RouteMeta {
     method: HttpMethod;
     path: string;
     options?: EndpointOptions | undefined;
-    handler: RequestHandler;
+    handler: (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
     adminUsernames?: string[];
     allowedAppIds?: string[];
 }
@@ -43,19 +44,14 @@ const createMethodDecorator = (method: HttpMethod) => {
         adminUsernames?: string[],
     ) => {
         const { allowedAppIds, ...options } = routeOptions ?? {};
-        return <
-            P extends Record<string, string | undefined> = Record<
-                string,
-        string | undefined
-            >,
-        >(
-            target: RequestHandler<P>,
+        return (
+            target: (req: Request, res: Response, next: NextFunction) => void | Promise<void>,
             _context: ClassMethodDecoratorContext<
                 This,
                 (
                     this: This,
-                    ...args: Parameters<RequestHandler<P>>
-                ) => ReturnType<RequestHandler<P>>
+                    ...args: [req: Request, res: Response, next: NextFunction]
+                ) => void | Promise<void>
             >,
         ) => {
             _context.addInitializer(function () {
@@ -86,11 +82,53 @@ export const Put = createMethodDecorator('put');
 export const Delete = createMethodDecorator('delete');
 // TODO DS: add others as needed (patch, etc)
 
+interface HttpErrorOptions {
+    cause?: unknown;
+    legacyCode?: string;
+    code?: string;
+    fields?: Record<string, unknown>;
+}
+
+const isHttpErrorOptions = (value: unknown): value is HttpErrorOptions => {
+    if ( !value || typeof value !== 'object' || Array.isArray(value) ) {
+        return false;
+    }
+
+    return (
+        Object.prototype.hasOwnProperty.call(value, 'cause')
+        || Object.prototype.hasOwnProperty.call(value, 'legacyCode')
+        || Object.prototype.hasOwnProperty.call(value, 'code')
+        || Object.prototype.hasOwnProperty.call(value, 'fields')
+    );
+};
+
 export class HttpError extends Error {
     statusCode: number;
-    constructor (statusCode: StatusCodes, message: string, cause?: unknown) {
-        super(`${statusCode} - ${message}`, { cause });
+    legacyCode?: string;
+    code?: string;
+    fields?: Record<string, unknown>;
+    constructor (
+        statusCode: StatusCodes,
+        message: string,
+        causeOrOptions?: unknown,
+        legacyCode?: string,
+    ) {
+        const options = isHttpErrorOptions(causeOrOptions)
+            ? causeOrOptions
+            : undefined;
+        const cause = options
+            ? options.cause
+            : causeOrOptions;
+        const resolvedLegacyCode = legacyCode ?? options?.legacyCode;
+        const code = options?.code;
+        super(
+            `${statusCode} - ${message}`,
+            cause !== undefined ? { cause } : undefined,
+        );
         this.statusCode = statusCode;
+        this.legacyCode = resolvedLegacyCode;
+        this.code = code;
+        this.fields = options?.fields;
     }
 }
 
@@ -131,43 +169,69 @@ export class ExtensionController {
                 logger.log(`Registering route: [${route.method.toUpperCase()}] ${fullPath}`);
 
                 (extension[route.method] as RouterMethods[HttpMethod])(
-                                fullPath,
-                                route.options || {},
-                                async (req, res, next) => {
-                                    try {
-                                        if ( adminsForRoute || allowedAppIds ) {
-                                            if ( ! req.actor ) {
-                                                throw new HttpError(StatusCodes.UNAUTHORIZED, 'Unauthenticated');
-                                            }
-                                        }
-                                        if ( adminsForRoute ) {
-                                            if ( ! adminsForRoute.includes(req.actor!.type.user.username) ) {
-                                                throw new HttpError(StatusCodes.FORBIDDEN,
-                                                                'Only admins may request this resource.');
-                                            }
-                                        }
-                                        if ( allowedAppIds ) {
-                                            if ( ( req.actor!.type?.app?.uid && !allowedAppIds.includes(req.actor!.type.app.uid) ) ) {
-                                                throw new HttpError(StatusCodes.FORBIDDEN,
-                                                                'This app may not request this resource.');
-                                            }
-                                        }
-                                        await route.handler.bind(this)(req, res, next);
-                                    } catch ( error ) {
-                                        if ( error instanceof HttpError ) {
-                                            res.status(error.statusCode).send({ error: error.message });
-                                            logger.warn('httpError:', error);
-                                            return;
-                                        }
-                                        if ( error instanceof Error ) {
-                                            res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({ error: error.message });
-                                            logger.error('Non-http error:', error);
-                                            return;
-                                        }
-                                        res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({ error: 'An unknown error occurred' });
-                                        logger.error('An unknown error occurred:', error);
+                    fullPath,
+                    route.options || {},
+                    async (req, res, next) => {
+                        try {
+                            if ( adminsForRoute || allowedAppIds ) {
+                                if ( ! req.actor ) {
+                                    throw new HttpError(StatusCodes.UNAUTHORIZED, 'Unauthenticated');
+                                }
+                            }
+                            if ( adminsForRoute ) {
+                                if ( ! adminsForRoute.includes(req.actor!.type.user.username) ) {
+                                    throw new HttpError(
+                                        StatusCodes.FORBIDDEN,
+                                        'Only admins may request this resource.',
+                                    );
+                                }
+                            }
+                            if ( allowedAppIds ) {
+                                if ( ( req.actor!.type?.app?.uid && !allowedAppIds.includes(req.actor!.type.app.uid) ) ) {
+                                    throw new HttpError(
+                                        StatusCodes.FORBIDDEN,
+                                        'This app may not request this resource.',
+                                    );
+                                }
+                            }
+                            return await route.handler.bind(this)(req, res, next);
+                        } catch ( error ) {
+                            if ( error instanceof HttpError ) {
+                                const payload: Record<string, unknown> = {
+                                    error: error.message,
+                                };
+                                if ( error.legacyCode ) {
+                                    payload.code = error.legacyCode;
+                                }
+                                if ( error.code ) {
+                                    if ( payload.code === undefined ) {
+                                        payload.code = error.code;
+                                    } else {
+                                        payload.errorCode = error.code;
                                     }
-                                });
+                                }
+                                if ( error.fields ) {
+                                    for ( const [key, value] of Object.entries(error.fields) ) {
+                                        if ( payload[key] !== undefined ) {
+                                            continue;
+                                        }
+                                        payload[key] = value;
+                                    }
+                                }
+                                res.status(error.statusCode).send(payload);
+                                logger.warn('httpError:', error);
+                                return;
+                            }
+                            if ( error instanceof Error ) {
+                                res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({ error: error.message });
+                                logger.error('Non-http error:', error);
+                                return;
+                            }
+                            res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({ error: 'An unknown error occurred' });
+                            logger.error('An unknown error occurred:', error);
+                        }
+                    },
+                );
             }
         }
     }

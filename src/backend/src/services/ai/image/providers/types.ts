@@ -8,6 +8,7 @@ export interface IImageModel {
     version?: string;
     costs_currency: string;
     index_cost_key?: string;
+    index_input_cost_key?: string;
     costs: Record<string, number>;
     allowedQualityLevels?: string[];
     allowedRatios?: { w: number, h: number }[];
@@ -20,6 +21,9 @@ export interface IGenerateParams {
     provider?: string,
     test_mode?: boolean
     quality?: string,
+    input_image?: string,
+    input_image_mime_type?: string,
+    input_images?: string[],
 };
 export interface IImageProvider {
 

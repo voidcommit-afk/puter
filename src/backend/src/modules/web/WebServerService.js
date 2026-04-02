@@ -25,8 +25,25 @@ const config = require('../../config.js');
 var http = require('http');
 const auth = require('../../middleware/auth.js');
 const measure = require('../../middleware/measure.js');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
 
 const relative_require = require;
+
+const normalizeHostDomain = (domain) => {
+    if ( typeof domain !== 'string' ) return null;
+    const normalizedDomain = domain.trim().toLowerCase().replace(/^\./, '');
+    if ( ! normalizedDomain ) return null;
+    return normalizedDomain.split(':')[0];
+};
+
+const hostMatchesDomain = (hostname, domain) => {
+    const normalizedHost = normalizeHostDomain(hostname);
+    const normalizedDomain = normalizeHostDomain(domain);
+    if ( !normalizedHost || !normalizedDomain ) return false;
+    return normalizedHost === normalizedDomain ||
+        normalizedHost.endsWith(`.${normalizedDomain}`);
+};
 
 /**
 * This class, WebServerService, is responsible for starting and managing the Puter web server.
@@ -44,11 +61,16 @@ class WebServerService extends BaseService {
         helmet: require('helmet'),
         cookieParser: require('cookie-parser'),
         compression: require('compression'),
-        ['on-finished']: require('on-finished'),
+        'on-finished': require('on-finished'),
         morgan: require('morgan'),
     };
 
     allowedRoutesWithUndefinedOrigins = [];
+    isDraining = false;
+    shutdownStarted = false;
+    shutdownForceExitTimer = null;
+    shutdownCloseTimer = null;
+    gracefulShutdownHandlersInstalled = false;
 
     allow_undefined_origin (route) {
         this.allowedRoutesWithUndefinedOrigins.push(route);
@@ -62,7 +84,7 @@ class WebServerService extends BaseService {
     * @private
     */
     // comment above line 44 in WebServerService.js
-    async ['__on_boot.consolidation'] () {
+    async '__on_boot.consolidation' () {
         const app = this.app;
         const services = this.services;
         await services.emit('install.middlewares.early', { app });
@@ -113,7 +135,7 @@ class WebServerService extends BaseService {
     *
     * @returns {Promise<void>} A promise that resolves once the server is started.
     */
-    async ['__on_boot.activation'] () {
+    async '__on_boot.activation' () {
         const services = this.services;
         await services.emit('start.webserver');
         await services.emit('ready.webserver');
@@ -128,7 +150,7 @@ class WebServerService extends BaseService {
     *
     * @return {Promise} A promise that resolves when the server is up and running.
     */
-    async ['__on_start.webserver'] () {
+    async '__on_start.webserver' () {
         // error handling middleware goes last, as per the
         // expressjs documentation:
         // https://expressjs.com/en/guide/error-handling.html
@@ -202,6 +224,13 @@ class WebServerService extends BaseService {
 
         const url = config.origin;
 
+        const args = yargs(hideBin(process.argv)).argv;
+        if ( args['server'] ) {
+            (async () => {
+                (await import('./../../../../../tools/auth_gui.js')).default(args['puter-backend']);
+            })();
+            config.no_browser_launch = true;
+        }
         // Open the browser to the URL of Puter
         // (if we are in development mode only)
         if ( config.env === 'dev' && !config.no_browser_launch ) {
@@ -216,6 +245,7 @@ class WebServerService extends BaseService {
         const link = `\x1B[34;1m${url}\x1B[0m`;
         const lines = [
             `Puter is now live at: ${link}`,
+            `listening on port: ${config.http_port}`,
         ];
         const realConsole = globalThis.original_console_object ?? console;
         lines.forEach(line => realConsole.log(line));
@@ -227,7 +257,8 @@ class WebServerService extends BaseService {
         server.timeout = 1000 * 60 * 60 * 2; // 2 hours
         server.requestTimeout = 1000 * 60 * 60 * 2; // 2 hours
         server.headersTimeout = 1000 * 60 * 60 * 2; // 2 hours
-        // server.keepAliveTimeout = 1000 * 60 * 60 * 2; // 2 hours
+        const albIdleTimeoutMs = 1000 * 60 * 5;
+        server.keepAliveTimeout = albIdleTimeoutMs + (1000 * 15);
 
         // Socket.io server instance
         // const socketio = require('../../socketio.js').init(server);
@@ -235,27 +266,36 @@ class WebServerService extends BaseService {
         // TODO: ^ Replace above line with the following code:
         await this.services.emit('install.socketio', { server });
         const socketio = this.services.get('socketio').io;
+        const authService = this.services.get('auth');
 
         // Socket.io middleware for authentication
         socketio.use(async (socket, next) => {
-            if ( socket.handshake.auth.auth_token ) {
-                try {
-                    let auth_res = await jwt_auth(socket);
-                    // successful auth
-                    socket.actor = auth_res.actor;
-                    socket.user = auth_res.user;
-                    socket.token = auth_res.token;
-                    // join user room
-                    socket.join(socket.user.id);
+            const authToken = socket.handshake?.auth?.auth_token;
+            if ( ! authToken ) {
+                next(new Error('socket auth token missing'));
+                return;
+            }
 
-                    // setTimeout 0 is needed because we need to send
-                    // the notifications after this handler is done
-                    // setTimeout(() => {
-                    // }, 1000);
-                    next();
-                } catch (e) {
-                    console.warn('socket auth err', e);
-                }
+            try {
+                const authRes = await jwt_auth(socket, authService);
+                // successful auth
+                socket.actor = authRes.actor;
+                socket.user = authRes.user;
+                socket.token = authRes.token;
+                // join user room
+                socket.join(socket.user.id);
+
+                // setTimeout 0 is needed because we need to send
+                // the notifications after this handler is done
+                // setTimeout(() => {
+                // }, 1000);
+                next();
+            } catch ( error ) {
+                console.warn('socket auth err', error);
+                const authError = error instanceof Error
+                    ? error
+                    : new Error('socket auth failed');
+                next(authError);
             }
         });
 
@@ -284,6 +324,7 @@ class WebServerService extends BaseService {
         });
 
         this.server_ = server;
+        this.registerGracefulShutdownHandlers();
         await this.services.emit('install.websockets');
     }
 
@@ -297,6 +338,87 @@ class WebServerService extends BaseService {
         return this.server_;
     }
 
+    registerGracefulShutdownHandlers () {
+        if ( this.gracefulShutdownHandlersInstalled ) return;
+        this.gracefulShutdownHandlersInstalled = true;
+
+        process.on('SIGTERM', () => {
+            this.beginGracefulShutdown('SIGTERM');
+        });
+        process.on('SIGINT', () => {
+            this.beginGracefulShutdown('SIGINT');
+        });
+    }
+
+    beginGracefulShutdown (signal) {
+        if ( this.shutdownStarted ) return;
+        this.shutdownStarted = true;
+        this.isDraining = true;
+        this.app?.set('isDraining', true);
+        this.drainCoreServicesForShutdown(signal);
+        const albFailoverDelayMs = 15 * 1000;
+
+        this.log.info(
+            `received ${signal}; beginning graceful shutdown with ${albFailoverDelayMs}ms ALB failover delay`,
+        );
+        const server = this.server_;
+        if ( ! server ) {
+            process.exit(0);
+            return;
+        }
+
+        this.shutdownForceExitTimer = setTimeout(() => {
+            this.log.error('graceful shutdown timed out; forcing process exit');
+            process.exit(1);
+        }, 110 * 1000);
+        if ( typeof this.shutdownForceExitTimer.unref === 'function' ) {
+            this.shutdownForceExitTimer.unref();
+        }
+
+        this.shutdownCloseTimer = setTimeout(() => {
+            this.shutdownCloseTimer = null;
+            if ( typeof server.closeIdleConnections === 'function' ) {
+                server.closeIdleConnections();
+            }
+
+            server.close((error) => {
+                if ( this.shutdownForceExitTimer ) {
+                    clearTimeout(this.shutdownForceExitTimer);
+                    this.shutdownForceExitTimer = null;
+                }
+
+                if ( error ) {
+                    this.log.error('error while closing HTTP server during shutdown', error);
+                    process.exit(1);
+                    return;
+                }
+
+                this.log.info('graceful shutdown completed');
+                process.exit(0);
+            });
+        }, albFailoverDelayMs);
+        if ( typeof this.shutdownCloseTimer.unref === 'function' ) {
+            this.shutdownCloseTimer.unref();
+        }
+    }
+
+    drainCoreServicesForShutdown (signal) {
+        const reason = `signal:${signal}`;
+        for ( const serviceName of ['alarm', 'server-health'] ) {
+            try {
+                const service = this.services.get(serviceName);
+                if ( typeof service?.beginDrain === 'function' ) {
+                    service.beginDrain(reason);
+                }
+            } catch ( error ) {
+                this.log.error(
+                    `failed to drain ${serviceName} during shutdown`,
+                    error,
+                );
+            }
+        }
+    }
+
     /**
     * Handles starting and managing the Puter web server.
     *
@@ -307,6 +429,7 @@ class WebServerService extends BaseService {
         this.app = app;
 
         app.set('services', this.services);
+        app.set('isDraining', false);
 
         this.middlewares = { auth };
 
@@ -324,6 +447,35 @@ class WebServerService extends BaseService {
 
         app.use(async (req, res, next) => {
             req.services = this.services;
+            next();
+        });
+
+        // When the user visits the main origin (not api/dav subdomain) with ?auth_token=<GUI token>
+        // (e.g. QR login), set the HTTP-only session cookie so user-protected endpoints work.
+        app.use(async (req, res, next) => {
+            const has_subdomain = req.hostname.slice(0, -1 * (config.domain.length + 1)) !== '';
+            if ( has_subdomain ) return next();
+
+            const token = req.query?.auth_token;
+            if ( !token || typeof token !== 'string' ) return next();
+
+            try {
+                const svc_auth = req.services.get('auth');
+                const cleanToken = token.replace('Bearer ', '').trim();
+                const actor = await svc_auth.authenticate_from_token(cleanToken);
+                const session_token = svc_auth.create_session_token_for_session(
+                    actor.type.user,
+                    actor.type.session,
+                );
+                res.cookie(config.cookie_name, session_token, {
+                    sameSite: 'none',
+                    secure: true,
+                    httpOnly: true,
+                });
+            } catch ( e ) {
+                console.log('query auth token (QR Code login probably) failed');
+                console.error(e);
+            }
             next();
         });
 
@@ -416,6 +568,7 @@ class WebServerService extends BaseService {
                 onFinished(res, () => {
                     if ( res.statusCode !== 500 ) return;
                     if ( req.__error_handled ) return;
+                    if ( req.path === '/healthcheck' ) return;
                     const alarm = this.services.get('alarm');
                     alarm.create('responded-500', 'server sent a 500 response', {
                         error: req.__error_source,
@@ -436,7 +589,8 @@ class WebServerService extends BaseService {
             // not setting the header at all. (that's my theory)
             if ( req.hostname === undefined ) {
                 res.status(400).send(
-                                'Please verify your browser is up-to-date.');
+                    'Please verify your browser is up-to-date.',
+                );
                 return;
             }
 
@@ -446,18 +600,26 @@ class WebServerService extends BaseService {
         // Validate host header against allowed domains to prevent host header injection
         // https://www.owasp.org/index.php/Host_Header_Injection
         app.use((req, res, next) => {
-            const allowedDomains = [
-                config.domain.toLowerCase(),
-                config.static_hosting_domain.toLowerCase(),
-                `at.${ config.static_hosting_domain.toLowerCase()}`,
-            ];
+            const allowedDomains = new Set();
+            const pushAllowedDomain = (domain) => {
+                const normalizedDomain = normalizeHostDomain(domain);
+                if ( normalizedDomain ) {
+                    allowedDomains.add(normalizedDomain);
+                }
+            };
 
-            if ( config.static_hosting_domain_alt ) {
-                allowedDomains.push(config.static_hosting_domain_alt.toLowerCase());
+            const staticHostingDomain = normalizeHostDomain(config.static_hosting_domain);
+            pushAllowedDomain(config.domain);
+            pushAllowedDomain(staticHostingDomain);
+            pushAllowedDomain(config.static_hosting_domain_alt);
+            pushAllowedDomain(config.private_app_hosting_domain);
+            pushAllowedDomain(config.private_app_hosting_domain_alt);
+            if ( staticHostingDomain ) {
+                pushAllowedDomain(`at.${staticHostingDomain}`);
             }
 
             if ( config.allow_nipio_domains ) {
-                allowedDomains.push('nip.io');
+                pushAllowedDomain('nip.io');
             }
 
             // Retrieve the Host header and ensure it's in a valid format
@@ -475,14 +637,24 @@ class WebServerService extends BaseService {
             // Parse the Host header to isolate the hostname (strip out port if present)
             const hostName = hostHeader.split(':')[0].trim().toLowerCase();
             // Check if the hostname matches any of the allowed domains or is a subdomain of an allowed domain
-            if ( allowedDomains.some(allowedDomain => hostName === allowedDomain || hostName.endsWith(`.${ allowedDomain}`)) ) {
+            // Exception: allow /healthcheck endpoint on the root domain
+            if (
+                req.path === '/healthcheck'
+            ) {
+                next();
+                return;
+            }
+            if ( [...allowedDomains].some(allowedDomain => hostMatchesDomain(hostName, allowedDomain)) ) {
                 next(); // Proceed if the host is valid
+                return;
             } else {
                 if ( ! config.custom_domains_enabled ) {
-                    return res.status(400).send('Invalid Host header.');
+                    res.status(400).send('Invalid Host header.');
+                    return;
                 }
                 req.is_custom_domain = true;
                 next();
+                return;
             }
         });
 
@@ -601,10 +773,22 @@ class WebServerService extends BaseService {
 
         app.use(function (req, res, next) {
             const origin = req.headers.origin;
+            const subdomain = req.subdomains[req.subdomains.length - 1];
+            const isApiOrDavRequest =
+                config.experimental_no_subdomain ||
+                subdomain === 'api' ||
+                subdomain === 'dav';
+            const isCrossOriginAuthRoute =
+                req.path === '/signup' ||
+                req.path === '/login' ||
+                req.path.startsWith('/extensions/') ||
+                req.path.startsWith('/auth/oidc');
 
             const is_site =
-                req.hostname.endsWith(config.static_hosting_domain) ||
-                (config.static_hosting_domain_alt && req.hostname.endsWith(config.static_hosting_domain_alt));
+                hostMatchesDomain(req.hostname, config.static_hosting_domain) ||
+                hostMatchesDomain(req.hostname, config.static_hosting_domain_alt) ||
+                hostMatchesDomain(req.hostname, config.private_app_hosting_domain) ||
+                hostMatchesDomain(req.hostname, config.private_app_hosting_domain_alt);
             req.hostname === 'docs.puter.com'
             ;
             const is_popup = !!req.query.embedded_in_popup;
@@ -617,16 +801,16 @@ class WebServerService extends BaseService {
                 req.co_isolation_enabled
                 ;
 
-            if ( req.path === '/signup' || req.path === '/login' || req.path.startsWith('/extensions/') ) {
+            if ( isCrossOriginAuthRoute || isApiOrDavRequest ) {
                 res.setHeader('Access-Control-Allow-Origin', origin ?? '*');
+                if ( origin ) {
+                    res.vary('Origin');
+                }
             }
-            // Website(s) to allow to connect
-            if (
-                config.experimental_no_subdomain ||
-                req.subdomains[req.subdomains.length - 1] === 'api' ||
-                req.subdomains[req.subdomains.length - 1] === 'dav'
-            ) {
-                res.setHeader('Access-Control-Allow-Origin', origin ?? '*');
+
+            // Allow browser credentials on API/DAV cross-origin requests.
+            if ( isApiOrDavRequest && origin ) {
+                res.setHeader('Access-Control-Allow-Credentials', 'true');
             }
 
             // Request methods to allow
@@ -639,10 +823,6 @@ class WebServerService extends BaseService {
 
             // Request headers to allow
             res.header('Access-Control-Allow-Headers', allowed_headers.join(', '));
-
-            // Set to true if you need the website to include cookies in the requests sent
-            // to the API (e.g. in case you use sessions)
-            // res.setHeader('Access-Control-Allow-Credentials', true);
 
             // Needed for SharedArrayBuffer
             // NOTE: This is put behind a configuration flag because we

@@ -16,100 +16,344 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-const BaseService = require('../../services/BaseService');
-const { CLink } = require('./connection/CLink');
-const { SLink } = require('./connection/SLink');
-const { Context } = require('../../util/context');
-const { Endpoint } = require('../../util/expressutil');
-const crypto = require('crypto');
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { Agent as HttpsAgent } from 'https';
+import axios from 'axios';
+import { redisClient } from '../../clients/redis/redisSingleton.js';
+import eggspress from '../../api/eggspress.js';
+import { BaseService } from '../../services/BaseService.js';
+import { Context } from '../../util/context.js';
 
-class BroadcastService extends BaseService {
-    static MODULES = {
-        express: require('express'),
-        // ['socket.io']: require('socket.io'),
-    };
-
-    _construct () {
-        this.peers_ = [];
-        this.connections_ = [];
-        this.trustedPublicKeys_ = {};
-        this.peersByKey_ = {};
-        this.webhookPeers_ = [];
-        this.incomingLastNonceByPeer_ = new Map();
-        this.outgoingNonceByPeer_ = new Map();
-    }
+export class BroadcastService extends BaseService {
+    #peersByKey = {};
+    #webhookPeers = [];
+    #incomingLastNonceByPeer = new Map();
+    #outgoingNonceByPeer = new Map();
+    #outboundEventsByDedupKey = new Map();
+    #outboundFlushTimer = null;
+    #outboundIsFlushing = false;
+    #dedupFallbackCounter = 0;
+    #webhookReplayWindowSeconds = 300;
+    #outboundFlushMs = 5000;
+    #webhookHostHeader = null;
+    #webhookProtocol = 'https';
+    #webhookHttpsAgent = new HttpsAgent({ rejectUnauthorized: false });
+    #redisPubSubChannel = 'broadcast.webhook.events';
+    #redisSubscriber = null;
+    #redisSourceId = randomUUID();
 
     async _init () {
         const peers = this.config.peers ?? [];
         const replayWindowSeconds = this.config.webhook_replay_window_seconds ?? 300;
+        const outboundFlushMs = Number(this.config.outbound_flush_ms ?? 2000);
 
         for ( const peer_config of peers ) {
-            this.trustedPublicKeys_[peer_config.key] = true;
-            this.peersByKey_[peer_config.key] = {
+            const peerId = this.#resolvePeerId(peer_config);
+            if ( ! peerId ) {
+                console.warn('ignoring broadcast peer config with missing key/peerId', { peer_config });
+                continue;
+            }
+
+            if ( this.#peersByKey[peerId] ) {
+                console.warn('duplicate broadcast peer id configured', {
+                    peerId,
+                    existing: this.#peersByKey[peerId]?.webhook_url,
+                    duplicate: peer_config.webhook_url,
+                });
+            }
+
+            this.#peersByKey[peerId] = {
                 webhook_secret: peer_config.webhook_secret,
                 webhook_url: peer_config.webhook_url,
                 webhook: !!peer_config.webhook,
             };
 
             if ( peer_config.webhook ) {
-                this.webhookPeers_.push(peer_config);
-            } else {
-                const peer = new CLink({
-                    keys: this.config.keys,
-                    config: peer_config,
-                    log: this.log,
+                this.#webhookPeers.push({
+                    ...peer_config,
+                    peerId,
                 });
-                this.peers_.push(peer);
-                peer.connect();
+            } else {
+                console.warn('ignoring non-webhook broadcast peer; websocket transport is disabled', {
+                    peerId,
+                });
             }
         }
 
-        this.webhookReplayWindowSeconds_ = replayWindowSeconds;
+        this.#webhookReplayWindowSeconds = replayWindowSeconds;
+        this.#outboundFlushMs = Number.isFinite(outboundFlushMs) && outboundFlushMs >= 0
+            ? outboundFlushMs
+            : 5000;
+        this.#webhookHostHeader = this.global_config.domain;
+        {
+            const protocol = String(this.global_config.protocol ?? '').trim().replace(/:$/, '').toLowerCase();
+            this.#webhookProtocol = protocol === 'http' || protocol === 'https' ? protocol : 'https';
+        }
+        this.#redisSourceId = `${String(this.global_config?.server_id ?? 'local')}:${randomUUID()}`;
 
-        this._register_commands(this.services.get('commands'));
+        await this.#initRedisPubSub();
 
         const svc_event = this.services.get('event');
-        svc_event.on('outer.*', this.on_event.bind(this));
+        svc_event.on('outer.*', this.outBroadcastEventHandler.bind(this));
+    }
 
-        // Test event (logs a message to console if DEBUG is set in env)
-        svc_event.on('test', (key, data, _meta) => {
-            const { contents } = data;
-            console.log(`Test Message: ${contents}`);
+    async outBroadcastEventHandler (key, data, meta) {
+        if ( meta?.from_outside ) return;
+
+        const safeMeta = this.#normalizeMeta(meta);
+        const outboundEvent = { key, data, meta: safeMeta };
+
+        // Mirror local outer.pub events to Redis so same-cluster replicas
+        // receive them even when this instance is the originator.
+        this.#publishWebhookEventsToRedis([outboundEvent]).catch(error => {
+            console.warn('local redis pubsub publish failed', { error, key });
         });
+
+        this.#enqueueOutboundEvent(outboundEvent);
     }
 
-    async on_event (key, data, meta) {
-        if ( meta.from_outside ) return;
+    #enqueueOutboundEvent (event) {
+        const dedupKey = this.#createDedupKey(event);
+        this.#outboundEventsByDedupKey.set(dedupKey, event);
+        this.#scheduleOutboundFlush();
+    }
 
-        for ( const peer of this.peers_ ) {
-            try {
-                peer.send({ key, data, meta });
-            } catch (e) {
-                //
-            }
-        }
-
-        for ( const peer_config of this.webhookPeers_ ) {
-            try {
-                await this.sendWebhookToPeer_(peer_config, key, data, meta);
-            } catch (e) {
-                this.log?.warn?.('broadcast webhook send failed', { peer: peer_config.key, error: e });
-            }
+    #createDedupKey (event) {
+        try {
+            return JSON.stringify(event);
+        } catch {
+            const fallbackKey = `fallback-${this.#dedupFallbackCounter}`;
+            this.#dedupFallbackCounter += 1;
+            return fallbackKey;
         }
     }
 
-    async ['__on_install.routes'] (_, { app }) {
+    #scheduleOutboundFlush () {
+        if ( this.#outboundFlushTimer ) return;
+
+        this.#outboundFlushTimer = setTimeout(async () => {
+            this.#outboundFlushTimer = null;
+            try {
+                await this.#flushOutboundEvents();
+            } catch ( error ) {
+                console.warn('outbound broadcast flush failed', { error });
+            }
+        }, this.#outboundFlushMs);
+    }
+
+    async #flushOutboundEvents () {
+        if ( this.#outboundIsFlushing || this.#outboundEventsByDedupKey.size === 0 ) return;
+
+        this.#outboundIsFlushing = true;
+        try {
+            const events = [...this.#outboundEventsByDedupKey.values()];
+            this.#outboundEventsByDedupKey.clear();
+
+            for ( const peer_config of this.#webhookPeers ) {
+                try {
+                    await this.#sendWebhookToPeer(peer_config, events);
+                } catch (e) {
+                    console.warn(`webhook broadcast send error: ${ JSON.stringify({ peer: peer_config.peerId ?? peer_config.key, error: e.message })}`);
+                }
+            }
+        } finally {
+            this.#outboundIsFlushing = false;
+            if ( this.#outboundEventsByDedupKey.size > 0 ) {
+                this.#scheduleOutboundFlush();
+            }
+        }
+    }
+
+    #normalizeMeta (meta) {
+        if ( !meta || typeof meta !== 'object' || Array.isArray(meta) ) {
+            return {};
+        }
+        return meta;
+    }
+
+    #resolveLocalPeerId () {
+        const localPeerId = this.config?.webhook?.peerId ?? this.config?.webhook?.key;
+        if ( typeof localPeerId !== 'string' || localPeerId.trim() === '' ) return null;
+        return localPeerId.trim();
+    }
+
+    #resolvePeerId (peerConfig) {
+        if ( !peerConfig || typeof peerConfig !== 'object' ) return null;
+        const peerId = peerConfig.peerId ?? peerConfig.key;
+        if ( typeof peerId !== 'string' || peerId.trim() === '' ) return null;
+        return peerId.trim();
+    }
+
+    #isNonceReplayForPeer ({ timestamp, nonce, peerId }) {
+        const lastSeen = this.#incomingLastNonceByPeer.get(peerId);
+        if ( ! lastSeen ) return false;
+
+        // A newer timestamp should reset nonce ordering for this peer.
+        if ( timestamp > lastSeen.timestamp ) return false;
+        if ( timestamp < lastSeen.timestamp ) return true;
+        return nonce <= lastSeen.nonce;
+    }
+
+    async #initRedisPubSub () {
+        if ( typeof redisClient?.duplicate !== 'function' ) {
+            console.warn('redis pubsub unavailable; duplicate client is not supported');
+            return;
+        }
+
+        try {
+            this.#redisSubscriber = redisClient.duplicate();
+            this.#redisSubscriber.on('error', error => {
+                console.warn('redis pubsub subscriber error', { error });
+            });
+            this.#redisSubscriber.on('message', (channel, message) => {
+                this.#handleRedisPubSubMessage(channel, message).catch(error => {
+                    console.warn('redis pubsub message handling error', { error });
+                });
+            });
+            await this.#redisSubscriber.subscribe(this.#redisPubSubChannel);
+        } catch ( error ) {
+            console.warn('failed to initialize redis pubsub subscriber', { error });
+            this.#redisSubscriber = null;
+        }
+    }
+
+    #isRedisWebhookEventKey (key) {
+        if ( typeof key !== 'string' ) return false;
+        return key === 'outer.pub' ||
+            key.startsWith('outer.pub.');
+    }
+
+    #filterRedisWebhookEvents (events) {
+        return events.filter(event => this.#isRedisWebhookEventKey(event?.key));
+    }
+
+    async #publishWebhookEventsToRedis (events) {
+        if ( !Array.isArray(events) || events.length === 0 ) return;
+
+        const eventsToPublish = this.#filterRedisWebhookEvents(events);
+        if ( eventsToPublish.length === 0 ) return;
+
+        let payload;
+        try {
+            payload = JSON.stringify({
+                sourceId: this.#redisSourceId,
+                events: eventsToPublish,
+            });
+        } catch ( error ) {
+            console.warn('redis pubsub publish failed: payload not serializable', { error });
+            return;
+        }
+
+        try {
+            await redisClient.publish(this.#redisPubSubChannel, payload);
+        } catch ( error ) {
+            console.warn('redis pubsub publish failed', { error });
+        }
+    }
+
+    async #handleRedisPubSubMessage (channel, message) {
+        if ( channel !== this.#redisPubSubChannel ) return;
+
+        let payload;
+        try {
+            payload = JSON.parse(message);
+        } catch {
+            console.warn('invalid redis pubsub payload: not json');
+            return;
+        }
+
+        if ( !payload || typeof payload !== 'object' || Array.isArray(payload) ) {
+            console.warn('invalid redis pubsub payload: expected object');
+            return;
+        }
+
+        if ( payload.sourceId && payload.sourceId === this.#redisSourceId ) {
+            return;
+        }
+
+        const incomingEvents = this.#normalizeIncomingPayload(payload);
+        if ( ! incomingEvents ) {
+            console.warn('invalid redis pubsub payload: invalid events');
+            return;
+        }
+
+        const eventsToEmit = this.#filterRedisWebhookEvents(incomingEvents);
+        if ( eventsToEmit.length === 0 ) return;
+
+        await this.#emitIncomingEventsSequentially(eventsToEmit);
+    }
+
+    #normalizeIncomingPayload (payload) {
+        if ( !payload || typeof payload !== 'object' || Array.isArray(payload) ) {
+            return null;
+        }
+
+        if ( Array.isArray(payload.events) ) {
+            const events = [];
+            for ( const event of payload.events ) {
+                const normalized = this.#normalizeIncomingEvent(event);
+                if ( ! normalized ) return null;
+                events.push(normalized);
+            }
+            return events;
+        }
+
+        const normalized = this.#normalizeIncomingEvent(payload);
+        if ( ! normalized ) return null;
+        return [normalized];
+    }
+
+    #normalizeIncomingEvent (event) {
+        if ( !event || typeof event !== 'object' || Array.isArray(event) ) {
+            return null;
+        }
+
+        const { key, data } = event;
+        if ( key === undefined || key === null ) {
+            return null;
+        }
+        if ( data === undefined ) {
+            return null;
+        }
+
+        return {
+            key,
+            data,
+            meta: this.#normalizeMeta(event.meta),
+        };
+    }
+
+    async #emitIncomingEventsSequentially (events) {
+        const svcEvent = this.services.get('event');
+        const context = Context.get(undefined, { allow_fallback: true });
+
+        for ( const event of events ) {
+            if ( event.meta?.from_outside ) {
+                console.warn('possible over-sending');
+                continue;
+            }
+
+            if ( event.key === 'test' ) {
+                console.debug(`test message: ${JSON.stringify(event.data)}`);
+            }
+
+            const metaOut = { ...event.meta, from_outside: true };
+            await context.arun(async () => {
+                await svcEvent.emit(event.key, event.data, metaOut);
+            });
+        }
+    }
+
+    async '__on_install.routes' (_, { app }) {
         const svc_web = this.services.get('web-server');
         svc_web.allow_undefined_origin('/broadcast/webhook');
 
-        Endpoint({
-            route: '/broadcast/webhook',
-            methods: ['POST'],
-            handler: this.handleWebhookRequest_.bind(this),
-        }).attach(app);
+        app.use(eggspress('/broadcast/webhook', {
+            allowedMethods: ['POST'],
+        }, this.#handleWebhookRequest.bind(this)));
     }
 
-    async handleWebhookRequest_ (req, res) {
+    async #handleWebhookRequest (req, res) {
         const rawBody = req.rawBody;
         if ( rawBody === undefined || rawBody === null ) {
             res.status(400).send({ error: { message: 'Missing or invalid body' } });
@@ -122,30 +366,25 @@ class BroadcastService extends BaseService {
             return;
         }
 
-        // Validate required properties
-        const { key, data, meta } = body;
-        if ( key === undefined || key === null ) {
-            res.status(400).send({ error: { message: 'Missing key' } });
-            return;
-        }
-        if ( data === undefined ) {
-            res.status(400).send({ error: { message: 'Missing data' } });
-            return;
-        }
-        if ( meta === undefined ) {
-            res.status(400).send({ error: { message: 'Missing meta' } });
+        const incomingEvents = this.#normalizeIncomingPayload(body);
+        if ( ! incomingEvents ) {
+            res.status(400).send({ error: { message: 'Invalid broadcast payload' } });
             return;
         }
 
-        const peerId = req.headers['x-broadcast-peer-id'];
+        const peerIdHeader = req.headers['x-broadcast-peer-id'];
+        const peerId = Array.isArray(peerIdHeader) ? peerIdHeader[0] : peerIdHeader;
         if ( ! peerId ) {
             res.status(403).send({ error: { message: 'Missing X-Broadcast-Peer-Id' } });
             return;
         }
+        const localPeerId = this.#resolveLocalPeerId();
+        if ( localPeerId && peerId === localPeerId ) {
+            res.status(200).send({ ok: true, ignored: 'self-peer' });
+            return;
+        }
 
-        this.log.debug('received peerId', { value: peerId });
-
-        const peer = this.peersByKey_[peerId];
+        const peer = this.#peersByKey[peerId];
         if ( !peer || !peer.webhook_secret ) {
             res.status(403).send({ error: { message: 'Unknown peer or webhook not configured' } });
             return;
@@ -163,7 +402,7 @@ class BroadcastService extends BaseService {
             return;
         }
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const window = this.webhookReplayWindowSeconds_;
+        const window = this.#webhookReplayWindowSeconds;
         if ( timestamp < nowSeconds - window || timestamp > nowSeconds + 60 ) {
             res.status(400).send({ error: { message: 'Timestamp out of window' } });
             return;
@@ -180,8 +419,7 @@ class BroadcastService extends BaseService {
             res.status(400).send({ error: { message: 'Invalid X-Broadcast-Nonce' } });
             return;
         }
-        const lastNonce = this.incomingLastNonceByPeer_.get(peerId) ?? -1;
-        if ( nonce <= lastNonce ) {
+        if ( this.#isNonceReplayForPeer({ timestamp, nonce, peerId }) ) {
             res.status(403).send({ error: { message: 'Duplicate or stale nonce' } });
             return;
         }
@@ -194,118 +432,87 @@ class BroadcastService extends BaseService {
         }
 
         const payloadToSign = `${timestamp}.${nonce}.${rawBody}`;
-        const expectedHmac = crypto.createHmac('sha256', peer.webhook_secret).update(payloadToSign).digest('hex');
+        const expectedHmac = createHmac('sha256', peer.webhook_secret).update(payloadToSign).digest('hex');
         const signatureBuffer = Buffer.from(signatureHeader, 'hex');
         const expectedBuffer = Buffer.from(expectedHmac, 'hex');
-        if ( signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer) ) {
+        if ( signatureBuffer.length !== expectedBuffer.length || !timingSafeEqual(signatureBuffer, expectedBuffer) ) {
             res.status(403).send({ error: { message: 'Invalid signature' } });
             return;
         }
 
-        this.incomingLastNonceByPeer_.set(peerId, nonce);
+        this.#incomingLastNonceByPeer.set(peerId, { timestamp, nonce });
 
-        // We emit the event sent to this webhook endpoint so other services
-        // can react to it. We set the `from_outside` flag to avoid feedback.
-        const svc_event = this.services.get('event');
-        const metaOut = { ...meta, from_outside: true };
-        const context = Context.get(undefined, { allow_fallback: true });
-        await context.arun(async () => {
-            this.log.debug('Emitting to the event service', {
-                key, data, metaOut,
-            });
-            await svc_event.emit(key, data, metaOut);
-        });
+        await this.#publishWebhookEventsToRedis(incomingEvents);
+        await this.#emitIncomingEventsSequentially(incomingEvents);
 
         res.status(200).send({ ok: true });
     }
 
-    async sendWebhookToPeer_ (peer_config, key, data, meta) {
-        const peerId = peer_config.key;
+    async #sendWebhookToPeer (peer_config, events) {
+        const peerId = this.#resolvePeerId(peer_config);
+        if ( ! peerId ) return;
         const url = peer_config.webhook_url;
+        const requestUrl = this.#normalizeWebhookUrl(url);
         const mySecretKey = this.config.webhook?.secret ?? '';
-        if ( !url || !mySecretKey ) return;
 
-        let nextNonce = this.outgoingNonceByPeer_.get(peerId) ?? 0;
-        this.outgoingNonceByPeer_.set(peerId, nextNonce + 1);
+        if ( !requestUrl || !mySecretKey ) return;
+
+        let nextNonce = this.#outgoingNonceByPeer.get(peerId) ?? 0;
+        this.#outgoingNonceByPeer.set(peerId, nextNonce + 1);
 
         const timestamp = Math.floor(Date.now() / 1000);
-        const body = { key, data, meta };
+        const body = { events };
         const rawBody = JSON.stringify(body);
         const payloadToSign = `${timestamp}.${nextNonce}.${rawBody}`;
-        const signature = crypto.createHmac('sha256', mySecretKey).update(payloadToSign).digest('hex');
+        const signature = createHmac('sha256', mySecretKey).update(payloadToSign).digest('hex');
 
-        const myPublicKey = this.config.webhook?.key ?? '';
-        this.log.debug('Sending webhook message to peer', { peerId });
-        const response = await fetch(url, {
+        const myPublicKey = this.config.webhook?.peerId ?? this.config.webhook?.key ?? '';
+        const headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(rawBody)),
+            'X-Broadcast-Peer-Id': myPublicKey,
+            'X-Broadcast-Timestamp': String(timestamp),
+            'X-Broadcast-Nonce': String(nextNonce),
+            'X-Broadcast-Signature': signature,
+            ...(this.#webhookHostHeader ? { Host: this.#webhookHostHeader } : {}),
+        };
+
+        const response = await axios.request({
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Broadcast-Peer-Id': myPublicKey,
-                'X-Broadcast-Timestamp': String(timestamp),
-                'X-Broadcast-Nonce': String(nextNonce),
-                'X-Broadcast-Signature': signature,
-            },
-            body: rawBody,
+            url: requestUrl,
+            headers,
+            data: rawBody,
+            timeout: 15000,
+            validateStatus: () => true,
+            responseType: 'text',
+            transformResponse: value => value,
+            ...(requestUrl.startsWith('https:')
+                ? { httpsAgent: this.#webhookHttpsAgent }
+                : {}),
         });
 
-        if ( ! response.ok ) {
+        if ( response.status < 200 || response.status >= 300 ) {
+            console.warn(`error with body: ${response.data}`);
             throw new Error(`Webhook POST failed: ${response.status} ${response.statusText}`);
         }
     }
 
-    async ['__on_install.websockets'] () {
-        const svc_event = this.services.get('event');
-        const svc_webServer = this.services.get('web-server');
+    #normalizeWebhookUrl (url) {
+        if ( typeof url !== 'string' || url.trim() === '' ) {
+            return null;
+        }
 
-        const server = svc_webServer.get_server();
+        const urlValue = url.trim();
+        let parsedUrl;
+        try {
+            parsedUrl = urlValue.includes('://')
+                ? new URL(urlValue)
+                : new URL(`${this.#webhookProtocol}://${urlValue}`);
+        } catch {
+            return null;
+        }
 
-        const io = require('socket.io')(server, {
-            cors: { origin: '*' },
-            path: '/wssinternal',
-        });
-
-        io.on('connection', async socket => {
-            const conn = new SLink({
-                keys: this.config.keys,
-                trustedKeys: this.trustedPublicKeys_,
-                socket,
-            });
-            this.connections_.push(conn);
-
-            conn.channels.message.on(({ key, data, meta }) => {
-                if ( meta.from_outside ) {
-                    console.warn('possible over-sending');
-                    return;
-                }
-
-                if ( key === 'test' ) {
-                    console.debug(`test message: ${
-                        JSON.stringify(data)}`);
-                }
-
-                meta.from_outside = true;
-                const context = Context.get(undefined, { allow_fallback: true });
-                context.arun(async () => {
-                    await svc_event.emit(key, data, meta);
-                });
-            });
-        });
-    }
-
-    _register_commands (commands) {
-        commands.registerCommands('broadcast', [
-            {
-                id: 'test',
-                description: 'send a test message',
-                handler: async () => {
-                    this.log.info('broadcast service test command was run');
-                    this.on_event('test', {
-                        contents: 'I am a test message',
-                    }, {});
-                },
-            },
-        ]);
+        parsedUrl.protocol = `${this.#webhookProtocol}:`;
+        return parsedUrl.toString();
     }
 }
-
-module.exports = { BroadcastService };

@@ -54,9 +54,13 @@ export const normalize_tools_object =  (tools) => {
                 fn.parameters ||
                 fn.input_schema;
 
-            normal_fn.parameters = parameters ?? {
-                type: 'object',
-            };
+            if ( !parameters || typeof parameters !== 'object' ) {
+                parameters = { type: 'object' };
+            } else if ( ! parameters.type ) {
+                parameters.type = 'object';
+            }
+
+            normal_fn.parameters = parameters;
 
             if ( parameters.properties ) {
                 parameters = normalize_json_schema(parameters);
@@ -81,7 +85,7 @@ export const normalize_tools_object =  (tools) => {
         } else if ( tool.type === 'function' ) {
             normalized_tool = {
                 type: 'function',
-                function: normalize_function(tool.function),
+                function: normalize_function(tool.function || tool),
             };
         } else {
             normalized_tool = {

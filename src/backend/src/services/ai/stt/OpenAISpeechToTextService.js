@@ -99,13 +99,13 @@ class OpenAISpeechToTextService extends BaseService {
     }
 
     static IMPLEMENTS = {
-        ['driver-capabilities']: {
+        'driver-capabilities': {
             supports_test_mode (iface, method_name) {
                 return iface === 'puter-speech2txt' &&
                     (method_name === 'transcribe' || method_name === 'translate');
             },
         },
-        ['puter-speech2txt']: {
+        'puter-speech2txt': {
             async list_models () {
                 return this.listModels();
             },
@@ -263,10 +263,11 @@ class OpenAISpeechToTextService extends BaseService {
             throw APIError.create('insufficient_funds');
         }
 
-        const openaiFile = await this.modules.openai.toFile(buffer,
-                        filename,
-                        mimeType ? { type: mimeType } : undefined);
-
+        const openaiFile = await this.modules.openai.toFile(
+            buffer,
+            filename,
+            mimeType ? { type: mimeType } : undefined,
+        );
         const payload = {
             file: openaiFile,
             model: selectedModel,
@@ -352,7 +353,11 @@ class OpenAISpeechToTextService extends BaseService {
         }
 
         if ( ! filename.includes('.') ) {
-            const extension = mimeType ? this.modules.mime.extension(mimeType) : 'mp3';
+            let extension = mimeType ? this.modules.mime.extension(mimeType) : 'mp3';
+            // No one uses mpga but mime resolves audio/mpeg to mpga
+            if ( extension === 'mpga' ) {
+                extension = 'mp3';
+            }
             filename = `${filename}.${extension || 'mp3'}`;
         }
 

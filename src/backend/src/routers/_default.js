@@ -25,8 +25,7 @@ const _fs = require('fs');
 const { Context } = require('../util/context');
 const { DB_READ } = require('../services/database/consts');
 const { PathBuilder } = require('../util/pathutil.js');
-
-let auth_user;
+const { jwt_auth, get_app, invalidate_cached_user } = require('../helpers');
 
 // Helper function to safely handle metadata parsing
 const parseMetadata = (metadata) => {
@@ -59,8 +58,18 @@ const parseMetadata = (metadata) => {
 // All other requests
 // -----------------------------------------------------------------------//
 router.all('*', async function (req, res, next) {
+    const authService = Context.get('services').get('auth');
+
     const subdomain = req.hostname.slice(0, -1 * (config.domain.length + 1));
     let path = req.params[0] ? req.params[0] : 'index.html';
+    let auth_user;
+    // TODO DS: we should just do this as a middleware for every request, and check all possible types of auth
+    try {
+        auth_user = (await jwt_auth(req, authService))?.user;
+    }
+    catch (e) {
+        // no-op
+    }
 
     // --------------------------------------
     // API
@@ -132,21 +141,6 @@ router.all('*', async function (req, res, next) {
     // No subdomain: either GUI or landing pages
     // --------------------------------------
     else if ( subdomain === '' ) {
-        // auth
-        const { jwt_auth, get_app, invalidate_cached_user } = require('../helpers');
-        let authed = false;
-        try {
-            try {
-                auth_user = await jwt_auth(req);
-                auth_user = auth_user.user;
-                authed = true;
-            } catch (e) {
-                authed = false;
-            }
-        }
-        catch (e) {
-            authed = false;
-        }
 
         if ( path === '/robots.txt' ) {
             res.set('Content-Type', 'text/plain');
@@ -211,8 +205,10 @@ router.all('*', async function (req, res, next) {
                 }
                 // mark user as confirmed
                 else {
-                    await db.write('UPDATE `user` SET `unsubscribed` = 1 WHERE id = ?',
-                                    [user.id]);
+                    await db.write(
+                        'UPDATE `user` SET `unsubscribed` = 1 WHERE id = ?',
+                        [user.id],
+                    );
 
                     invalidate_cached_user(user);
 
@@ -263,12 +259,14 @@ router.all('*', async function (req, res, next) {
                         const svc_cleanEmail = req.services.get('clean-email');
                         const clean_email = svc_cleanEmail.clean(user.email);
                         // If other users have the same CONFIRMED email, display an error
-                        const maybe_rows = await db.read(`SELECT EXISTS(
+                        const maybe_rows = await db.read(
+                            `SELECT EXISTS(
                                 SELECT 1 FROM user WHERE (email=? OR clean_email=?)
                                 AND email_confirmed=1
                                 AND password IS NOT NULL
                             ) AS email_exists`,
-                        [user.email, clean_email]);
+                            [user.email, clean_email],
+                        );
                         if ( maybe_rows[0]?.email_exists ) {
                             // TODO: maybe display the username of that account
                             h += '<p style="text-align:center; color:red;">' +
@@ -277,12 +275,16 @@ router.all('*', async function (req, res, next) {
                         }
 
                         // If other users have the same unconfirmed email, revoke it
-                        await db.write('UPDATE `user` SET `unconfirmed_change_email` = NULL, `change_email_confirm_token` = NULL WHERE `unconfirmed_change_email` = ?',
-                                        [user.email]);
+                        await db.write(
+                            'UPDATE `user` SET `unconfirmed_change_email` = NULL, `change_email_confirm_token` = NULL WHERE `unconfirmed_change_email` = ?',
+                            [user.email],
+                        );
 
                         // update user
-                        await db.write('UPDATE `user` SET `email_confirmed` = 1, `requires_email_confirmation` = 0 WHERE id = ?',
-                                        [user.id]);
+                        await db.write(
+                            'UPDATE `user` SET `email_confirmed` = 1, `requires_email_confirmation` = 0 WHERE id = ?',
+                            [user.id],
+                        );
                         invalidate_cached_user(user);
 
                         // send realtime success msg to client
@@ -382,7 +384,7 @@ router.all('*', async function (req, res, next) {
             // index.js
             if ( path === '/' ) {
                 const svc_puterHomepage = Context.get('services').get('puter-homepage');
-                return svc_puterHomepage.send({ req, res }, {
+                return svc_puterHomepage.send({ req, res, auth_user }, {
                     title: app_title,
                     description: app_description || config.short_description,
                     short_description: app_description || config.short_description,
@@ -488,4 +490,4 @@ router.all('*', async function (req, res, next) {
     }
 });
 
-module.exports = router;
+module.exports.catchAllRouter = router;

@@ -22,16 +22,16 @@ import { ErrorService } from '../../../modules/core/ErrorService.js';
 import { Context } from '../../../util/context.js';
 import BaseService from '../../BaseService.js';
 import { BaseDatabaseAccessService } from '../../database/BaseDatabaseAccessService.js';
-import { DB_WRITE } from '../../database/consts.js';
 import { DriverService } from '../../drivers/DriverService.js';
 import { TypedValue } from '../../drivers/meta/Runtime.js';
 import { EventService } from '../../EventService.js';
 import { MeteringService } from '../../MeteringService/MeteringService.js';
+import { CloudflareImageGenerationProvider } from './providers/CloudflareImageGenerationProvider/CloudflareImageGenerationProvider.js';
 import { GeminiImageGenerationProvider } from './providers/GeminiImageGenerationProvider/GeminiImageGenerationProvider.js';
 import { OpenAiImageGenerationProvider } from './providers/OpenAiImageGenerationProvider/OpenAiImageGenerationProvider.js';
 import { TogetherImageGenerationProvider } from './providers/TogetherImageGenerationProvider/TogetherImageGenerationProvider.js';
-import { XAIImageGenerationProvider } from './providers/XAIImageGenerationProvider/XAIImageGenerationProvider.js';
 import { IGenerateParams, IImageModel, IImageProvider } from './providers/types.js';
+import { XAIImageGenerationProvider } from './providers/XAIImageGenerationProvider/XAIImageGenerationProvider.js';
 
 export class AIImageGenerationService extends BaseService {
 
@@ -44,7 +44,7 @@ export class AIImageGenerationService extends BaseService {
     }
 
     get db (): BaseDatabaseAccessService {
-        return this.services.get('database').get(DB_WRITE, 'ai-service');
+        return this.services.get('database').get();
     }
 
     get errorService (): ErrorService {
@@ -68,13 +68,13 @@ export class AIImageGenerationService extends BaseService {
 
     /** Driver interfaces */
     static IMPLEMENTS = {
-        ['driver-capabilities']: {
+        'driver-capabilities': {
             supports_test_mode (iface: string, method_name: string) {
                 return iface === 'puter-image-generation' &&
                     method_name === 'generate';
             },
         },
-        ['puter-image-generation']: {
+        'puter-image-generation': {
 
             async generate (...parameters: Parameters<AIImageGenerationService['generate']>) {
                 return (this as unknown as AIImageGenerationService).generate(...parameters);
@@ -84,12 +84,22 @@ export class AIImageGenerationService extends BaseService {
 
     getModel ({ modelId, provider }: { modelId: string, provider?: string }) {
         const models = this.#modelIdMap[modelId];
-
-        if ( ! provider ) {
-            return models[0];
+        if ( ! models ) {
+            return undefined;
         }
-        const model = models.find(m => m.provider === provider);
-        return model ?? models[0];
+
+        if ( provider ) {
+            const model = models.find(m => m.provider === provider);
+            return model ?? models[0];
+        }
+
+        // If no provider is specified, prefer a model whose puterId exactly matches the requested modelId.
+        const exactPuterIdMatch = models.find(m => m.puterId === modelId);
+        if ( exactPuterIdMatch ) {
+            return exactPuterIdMatch;
+        }
+
+        return models[0];
     }
 
     private async registerProviders () {
@@ -114,6 +124,19 @@ export class AIImageGenerationService extends BaseService {
             this.#providers['xai-image-generation'] = new XAIImageGenerationProvider({ apiKey: xaiConfig.apiKey || xaiConfig.secret_key }, this.meteringService, this.errorService);
         }
 
+        const cloudflareImageConfig = this.config.providers?.['cloudflare-image-generation'] ||
+            this.config.providers?.['cloudflare-workers-ai-image'] ||
+            this.global_config?.services?.['cloudflare-image-generation'] ||
+            this.global_config?.services?.['cloudflare-workers-ai-image'] ||
+            this.global_config?.services?.['cloudflare-workers-ai'];
+        if ( cloudflareImageConfig && (cloudflareImageConfig.apiToken || cloudflareImageConfig.apiKey || cloudflareImageConfig.secret_key) && (cloudflareImageConfig.accountId || cloudflareImageConfig.account_id) ) {
+            this.#providers['cloudflare-image-generation'] = new CloudflareImageGenerationProvider({
+                apiToken: cloudflareImageConfig.apiToken || cloudflareImageConfig.apiKey || cloudflareImageConfig.secret_key,
+                accountId: cloudflareImageConfig.accountId || cloudflareImageConfig.account_id,
+                apiBaseUrl: cloudflareImageConfig.apiBaseUrl,
+            }, this.meteringService, this.errorService, this.eventService);
+        }
+
         // emit event for extensions to add providers
         const extensionProviders = {} as Record<string, IImageProvider>;
         await this.eventService.emit('ai.image.registerProviders', extensionProviders);
@@ -136,13 +159,21 @@ export class AIImageGenerationService extends BaseService {
             const provider = this.#providers[providerName];
 
             // alias all driver requests to go here to support legacy routing
-            this.driverService.register_service_alias(AIImageGenerationService.SERVICE_NAME,
-                            providerName,
-                            { iface: 'puter-image-generation' });
+            this.driverService.register_service_alias(
+                AIImageGenerationService.SERVICE_NAME,
+                providerName,
+                { iface: 'puter-image-generation' },
+            );
 
             // build model id map
             for ( const model of await provider.models() ) {
                 model.id = model.id.trim().toLowerCase();
+                if ( model.puterId ) {
+                    model.puterId = model.puterId.trim().toLowerCase();
+                }
+                if ( model.aliases ) {
+                    model.aliases = model.aliases.map(alias => alias.trim().toLowerCase());
+                }
                 if ( ! this.#modelIdMap[model.id] ) {
                     this.#modelIdMap[model.id] = [];
                 }
@@ -177,9 +208,18 @@ export class AIImageGenerationService extends BaseService {
     }
 
     models () {
+        const seen = new Set<string>();
         return Object.entries(this.#modelIdMap)
             .map(([_, models]) => models)
             .flat()
+            .filter(model => {
+                const identity = `${model.provider}:${model.puterId || model.id}`;
+                if ( seen.has(identity) ) {
+                    return false;
+                }
+                seen.add(identity);
+                return true;
+            })
             .sort((a, b) => {
                 if ( a.provider === b.provider ) {
                     return a.id.localeCompare(b.id);
@@ -195,6 +235,10 @@ export class AIImageGenerationService extends BaseService {
     async generate (parameters: IGenerateParams) {
         const clientDriverCall = Context.get('client_driver_call');
         let { test_mode: testMode, intended_service: legacyProviderName } = clientDriverCall as { test_mode?: boolean; response_metadata: Record<string, unknown>; intended_service?: string };
+
+        if ( parameters.model ) {
+            parameters.model = parameters.model.trim().toLowerCase();
+        }
 
         const configuredProviders = Object.keys(this.#providers);
         if ( configuredProviders.length === 0 ) {

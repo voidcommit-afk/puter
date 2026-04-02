@@ -66,11 +66,13 @@ class LogContext {
     }
 
     sub (name, fields = {}) {
-        return new LogContext(this.logService,
-                        {
-                            crumbs: name ? [...this.crumbs, name] : [...this.crumbs],
-                            fields: { ...this.fields, ...fields },
-                        });
+        return new LogContext(
+            this.logService,
+            {
+                crumbs: name ? [...this.crumbs, name] : [...this.crumbs],
+                fields: { ...this.fields, ...fields },
+            },
+        );
     }
 
     info (message, fields, objects) {
@@ -99,9 +101,11 @@ class LogContext {
     }
 
     cache (isCacheHit, identifier, fields = {}) {
-        this.log(LOG_LEVEL_DEBU,
-                        isCacheHit ? 'cache_hit' : 'cache_miss',
-                        { identifier, ...fields });
+        this.log(
+            LOG_LEVEL_DEBU,
+            isCacheHit ? 'cache_hit' : 'cache_miss',
+            { identifier, ...fields },
+        );
     }
 
     log (log_level, message, fields = {}, objects = {}) {
@@ -127,13 +131,16 @@ class LogContext {
         }
         if ( Context.get('injected_logger', { allow_fallback: true }) ) {
             Context.get('injected_logger').log(
-                            message + (fields ? (`; fields: ${ JSON.stringify(fields)}`) : ''));
+                message + (fields ? (`; fields: ${ JSON.stringify(fields)}`) : ''),
+            );
         }
-        this.logService.log_(log_level,
-                        this.crumbs,
-                        message,
-                        fields,
-                        objects);
+        this.logService.log_(
+            log_level,
+            this.crumbs,
+            message,
+            fields,
+            objects,
+        );
     }
 
     /**
@@ -342,11 +349,13 @@ class CustomLogger {
         if ( ret && ret.skip ) return;
 
         if ( ! ret ) {
-            this.delegate.onLogMessage(log_lvl,
-                            crumbs,
-                            message,
-                            fields,
-                            ...a);
+            this.delegate.onLogMessage(
+                log_lvl,
+                crumbs,
+                message,
+                fields,
+                ...a,
+            );
             return;
         }
 
@@ -358,11 +367,13 @@ class CustomLogger {
             args,
         } = ret;
 
-        this.delegate.onLogMessage(_log_lvl ?? log_lvl,
-                        _crumbs ?? crumbs,
-                        _message ?? message,
-                        _fields ?? fields,
-                        ...(args ?? a ?? []));
+        this.delegate.onLogMessage(
+            _log_lvl ?? log_lvl,
+            _crumbs ?? crumbs,
+            _message ?? message,
+            _fields ?? fields,
+            ...(args ?? a ?? []),
+        );
     }
 }
 
@@ -398,7 +409,7 @@ class LogService extends BaseService {
     /**
      * Registers logging commands with the command service.
      */
-    ['__on_boot.consolidation'] () {
+    '__on_boot.consolidation' () {
         const commands = this.services.get('commands');
         commands.registerCommands('logs', [
             {
@@ -471,11 +482,18 @@ class LogService extends BaseService {
 
         let logger;
 
-        if ( ! config.no_winston )
-        {
-            logger = new WinstonLogger(winston.createLogger({
-                levels: WINSTON_LEVELS,
-                transports: [
+        if ( ! config.no_winston ) {
+            const requested_level = config.logger?.level;
+            const winston_level = typeof requested_level === 'string'
+                ? requested_level.toLowerCase()
+                : undefined;
+            const transports = config.toConsole
+                ? [
+                    new winston.transports.Console({
+                        level: winston_level ?? 'info',
+                    }),
+                ]
+                : [
                     new winston.transports.DailyRotateFile({
                         level: 'http',
                         filename: `${this.log_directory}/%DATE%.log`,
@@ -497,7 +515,11 @@ class LogService extends BaseService {
                         maxSize: '20m',
                         maxFiles: '2d',
                     }),
-                ],
+                ];
+
+            logger = new WinstonLogger(winston.createLogger({
+                levels: WINSTON_LEVELS,
+                transports,
             }));
         }
 
@@ -584,11 +606,13 @@ class LogService extends BaseService {
      * @returns {LogContext} A new log context with the specified prefix and fields
      */
     create (prefix, fields = {}) {
-        const logContext = new LogContext(this,
-                        {
-                            crumbs: [prefix],
-                            fields,
-                        });
+        const logContext = new LogContext(
+            this,
+            {
+                crumbs: [prefix],
+                fields,
+            },
+        );
 
         return logContext;
     }

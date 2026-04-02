@@ -1,4 +1,4 @@
-export type AIMessageContent = string | { image_url?: { url: string } } | Record<string, unknown>;
+export type AIMessageContent = string | { image_url?: { url: string } } | { video_url?: { url: string } } | Record<string, unknown>;
 
 export interface ChatMessage {
     role?: string;
@@ -82,8 +82,10 @@ export interface Txt2ImgOptions {
 export interface Txt2VidOptions {
     prompt?: string;
     provider?: string;
+    driver?: string;
     model?: string;
     seconds?: number;
+    duration?: number;
     test_mode?: boolean;
 
     // OpenAI options

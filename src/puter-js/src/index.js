@@ -21,6 +21,7 @@ import Perms from './modules/Perms.js';
 import UI from './modules/UI.js';
 import Util from './modules/Util.js';
 import { WorkersHandler } from './modules/Workers.js';
+import Peer from './modules/Peer.js';
 
 class SimpleLogger {
     constructor (fields = {}) {
@@ -172,6 +173,7 @@ const puterInit = (function () {
             this.registerModule('perms', Perms);
             this.registerModule('drivers', Drivers);
             this.registerModule('debug', Debug);
+            this.registerModule('peer', Peer);
 
             // Path
             this.path = path;
@@ -191,6 +193,18 @@ const puterInit = (function () {
 
             // Holds the query parameters found in the current URL
             let URLParams = new URLSearchParams(globalThis.location?.search);
+            const normalizeAuthTokenCandidate = (tokenCandidate) => {
+                if ( typeof tokenCandidate !== 'string' ) return null;
+                const trimmedTokenCandidate = tokenCandidate.trim();
+                if (
+                    !trimmedTokenCandidate ||
+                    trimmedTokenCandidate === 'null' ||
+                    trimmedTokenCandidate === 'undefined'
+                ) {
+                    return null;
+                }
+                return trimmedTokenCandidate;
+            };
 
             // Figure out the environment in which the SDK is running
             if ( URLParams.has('puter.app_instance_id') ) {
@@ -325,22 +339,31 @@ const puterInit = (function () {
             // Loaded in an iframe in the Puter GUI (i.e. 'app')
             // When SDK is loaded in App mode the initiation process should start when the DOM is ready
             else if ( this.env === 'app' ) {
-                this.authToken = decodeURIComponent(URLParams.get('puter.auth.token'));
-                // initialize submodules
-                this.initSubmodules();
-                // If the authToken is already set in localStorage, then we don't need to show the dialog
+                const bootstrapAuthToken = normalizeAuthTokenCandidate(
+                    URLParams.get('puter.auth.token') ?? URLParams.get('auth_token'),
+                );
                 try {
-                    if ( localStorage.getItem('puter.auth.token') ) {
-                        this.setAuthToken(localStorage.getItem('puter.auth.token'));
+                    if ( bootstrapAuthToken ) {
+                        this.setAuthToken(bootstrapAuthToken);
+                    } else {
+                        const storedAuthToken = normalizeAuthTokenCandidate(
+                            localStorage.getItem('puter.auth.token'),
+                        );
+                        // If the authToken is already set in localStorage, then we don't need to show the dialog
+                        if ( storedAuthToken ) {
+                            this.setAuthToken(storedAuthToken);
+                        }
                     }
                     // if appID is already set in localStorage, then we don't need to show the dialog
-                    if ( localStorage.getItem('puter.app.id') ) {
-                        this.setAppID(localStorage.getItem('puter.app.id'));
+                    const storedAppID = localStorage.getItem('puter.app.id');
+                    if ( storedAppID ) {
+                        this.setAppID(storedAppID);
                     }
                 } catch ( error ) {
                     // Handle the error here
                     console.error('Error accessing localStorage:', error);
                 }
+                this.initSubmodules();
             }
             // SDK was loaded in a 3rd-party website.
             // When SDK is loaded in GUI the initiation process should start when the DOM is ready. This is because

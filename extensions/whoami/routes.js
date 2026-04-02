@@ -76,6 +76,7 @@ extension.get('/whoami', { subdomain: 'api' }, async (req, res, next) => {
         }
     }
 
+    const oidc_only = req.user.password === null;
     const details = {
         username: req.user.username,
         uuid: req.user.uuid,
@@ -88,6 +89,23 @@ extension.get('/whoami', { subdomain: 'api' }, async (req, res, next) => {
         desktop_bg_color: req.user.desktop_bg_color,
         desktop_bg_fit: req.user.desktop_bg_fit,
         is_temp: (req.user.password === null && req.user.email === null),
+        oidc_only,
+        ...(oidc_only ? await (async () => {
+            try {
+                const svc_oidc = req.services.get('oidc');
+                const providers = await svc_oidc.getEnabledProviderIds();
+                const origin = (svc_oidc.global_config?.origin || '').replace(/\/$/, '');
+                const provider = providers && providers[0];
+                if ( provider ) {
+                    return {
+                        oidc_revalidate_url: `${origin}/auth/oidc/${provider}/start?flow=revalidate&user_id=${req.user.id}`,
+                    };
+                }
+                return {};
+            } catch ( _e ) {
+                return {};
+            }
+        })() : {}),
         taskbar_items: await get_taskbar_items(req.user, {
             ...(req.query.icon_size
                 ? { icon_size: req.query.icon_size }
@@ -98,6 +116,7 @@ extension.get('/whoami', { subdomain: 'api' }, async (req, res, next) => {
         human_readable_age: timeago.format(new Date(req.user.timestamp)),
         hasDevAccountAccess: !!req.actor.type.user.metadata?.hasDevAccountAccess,
         ...(req.new_token ? { token: req.token } : {}),
+        is_user_token: true, // gets deleted if not a user token
     };
 
     // TODO: redundant? GetUserService already puts these values on 'user'
@@ -128,6 +147,7 @@ extension.get('/whoami', { subdomain: 'api' }, async (req, res, next) => {
         delete details.taskbar_items;
         delete details.token;
         delete details.human_readable_age;
+        delete details.is_user_token;
     }
 
     if ( actor.type instanceof AppUnderUserActorType ) {
@@ -214,6 +234,7 @@ extension.post('/whoami', { subdomain: 'api' }, async (req, res) => {
         }
     }
 
+    const oidc_only = req.user.password === null;
     // send user object
     res.send(Object.assign({
         username: req.user.username,
@@ -226,6 +247,7 @@ extension.post('/whoami', { subdomain: 'api' }, async (req, res) => {
         desktop_bg_color: req.user.desktop_bg_color,
         desktop_bg_fit: req.user.desktop_bg_fit,
         is_temp: (req.user.password === null && req.user.email === null),
+        oidc_only,
         taskbar_items: await get_taskbar_items(req.user),
         desktop_items: desktop_items,
         referral_code: req.user.referral_code,

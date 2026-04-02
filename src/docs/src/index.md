@@ -93,6 +93,7 @@ Puter.js is powered by [Puter](https://github.com/HeyPuter/puter), the open-sour
     <div class="example-group" data-section="kv" data-icon="kv_outline" data-icon-active="kv_active"><i class="icon"></i><span>NoSQL Database</span></div>
     <div class="example-group" data-section="hosting" data-icon="hosting_outline" data-icon-active="hosting_active"><i class="icon"></i><span>Hosting</span></div>
     <div class="example-group" data-section="auth" data-icon="auth_outline" data-icon-active="auth_active"><i class="icon"></i><span>Auth</span></div>
+    <div class="example-group" data-section="networking" data-icon="networking_outline" data-icon-active="networking_active"><i class="icon"></i><span>Networking</span></div>
 </div>
 
 <div class="example-content" data-section="fs">
@@ -163,15 +164,15 @@ Puter.js is powered by [Puter](https://github.com/HeyPuter/puter), the open-sour
 
 <div class="example-content" data-section="ai" style="display:block;">
 
-#### Chat with GPT-5 nano
+#### Chat with GPT-5.4 nano
 
 ```html;intro-chatgpt
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>
     <script>
-        // Chat with GPT-5 nano
-        puter.ai.chat(`What is life?`, { model: "gpt-5-nano" }).then(puter.print);
+        // Chat with GPT-5.4 nano
+        puter.ai.chat(`What is life?`, { model: "gpt-5.4-nano" }).then(puter.print);
     </script>
 </body>
 </html>
@@ -187,7 +188,7 @@ Puter.js is powered by [Puter](https://github.com/HeyPuter/puter), the open-sour
     <script>
         puter.ai
             .chat(`What do you see?`, `https://assets.puter.site/doge.jpeg`, {
-                model: "gpt-5-nano",
+                model: "gpt-5.4-nano",
             })
             .then(puter.print);
     </script>
@@ -276,6 +277,32 @@ Puter.js is powered by [Puter](https://github.com/HeyPuter/puter), the open-sour
                 puter.print('Signed in<br>' + JSON.stringify(res));
             });
         });
+    </script>
+</body>
+</html>
+```
+
+</div>
+
+<div class="example-content" data-section="networking">
+
+#### Fetch a resource without CORS restrictions
+
+```html;net-fetch
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+    (async () => {
+        // Send a GET request to example.com
+        const request = await puter.net.fetch("https://example.com");
+
+        // Get the response body as text
+        const body = await request.text();
+
+        // Print the body as a code block
+        puter.print(body, { code: true });
+    })()
     </script>
 </body>
 </html>

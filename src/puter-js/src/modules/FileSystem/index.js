@@ -9,6 +9,7 @@ const LAST_VALID_TS = 'last_valid_ts';
 
 // Operations
 import FSItem from '../FSItem.js';
+import Batch from './Batch.js';
 import copy from './operations/copy.js';
 import deleteFSEntry from './operations/deleteFSEntry.js';
 import getReadURL from './operations/getReadUrl.js';
@@ -60,6 +61,7 @@ export class PuterJSFileSystemModule {
      */
     constructor (puter) {
         this.puter = puter;
+        this.Batch = Batch(puter);
         this.authToken = puter.authToken;
         this.APIOrigin = puter.APIOrigin;
         this.appID = puter.appID;
@@ -96,10 +98,31 @@ export class PuterJSFileSystemModule {
             auth: {
                 auth_token: this.authToken,
             },
-            autoUnref: this.puter.env === 'nodejs',
+            // socket.io's autoUnref path expects ws._socket.unref() to exist.
+            // Enable it only for Node runtimes that expose a ws-like WebSocket.
+            autoUnref: this.shouldUseSocketAutoUnref(),
+            transports: ['websocket', 'polling'],
+            withCredentials: true,
         });
 
         this.bindSocketEvents();
+    }
+
+    shouldUseSocketAutoUnref () {
+        if ( this.puter.env !== 'nodejs' ) {
+            return false;
+        }
+
+        const WebSocketImpl = globalThis.WebSocket;
+        if ( typeof WebSocketImpl !== 'function' ) {
+            return false;
+        }
+
+        const wsPrototype = WebSocketImpl.prototype ?? {};
+        // ws package instances are EventEmitter-like; Undici WebSocket is EventTarget-like.
+        // autoUnref is only safe on the ws path.
+        return typeof wsPrototype.on === 'function' &&
+            typeof wsPrototype.removeListener === 'function';
     }
 
     bindSocketEvents () {

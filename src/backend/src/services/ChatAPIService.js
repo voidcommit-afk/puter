@@ -16,8 +16,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
-const { Endpoint } = require('../util/expressutil');
+const eggspress = require('../api/eggspress');
 const BaseService = require('./BaseService');
 const APIError = require('../api/APIError');
 
@@ -30,7 +29,6 @@ const APIError = require('../api/APIError');
 class ChatAPIService extends BaseService {
     static MODULES = {
         express: require('express'),
-        Endpoint: Endpoint,
     };
 
     /**
@@ -40,7 +38,7 @@ class ChatAPIService extends BaseService {
     * @param {Express} options.app Express application instance to install routes on
     * @returns {Promise<void>}
     */
-    async ['__on_install.routes'] (_, { app }) {
+    async '__on_install.routes' (_, { app }) {
         // Create a router for chat API endpoints
         const router = (() => {
             const require = this.require;
@@ -62,156 +60,121 @@ class ChatAPIService extends BaseService {
     * @private
     */
     install_chat_endpoints_ ({ router }) {
-        const Endpoint = this.require('Endpoint');
         router.use(require('../routers/puterai/openai/completions'));
         router.use(require('../routers/puterai/openai/chat_completions'));
+        router.use(require('../routers/puterai/openai/responses'));
+        router.use(require('../routers/puterai/anthropic/messages'));
         // Endpoint to list available AI chat models
-        Endpoint({
-            route: '/chat/models',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    // Use SUService to access AIChatService as system user
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const svc_aiChat = this.services.get('ai-chat');
-                        // Return the simple model list which contains basic model information
-                        return svc_aiChat.list();
-                    });
+        router.use(eggspress('/chat/models', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                // Use SUService to access AIChatService as system user
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_aiChat = this.services.get('ai-chat');
+                    // Return the simple model list which contains basic model information
+                    return svc_aiChat.list();
+                });
 
-                    // Return the list of models
-                    res.json({ models: models.filter(e => !['costly', 'fake', 'abuse', 'model-fallback-test-1'].includes(e)) });
-                } catch ( error ) {
-                    this.log.error('Error fetching models:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+                // Return the list of models
+                res.json({ models: models.filter(e => !['costly', 'fake', 'abuse', 'model-fallback-test-1'].includes(e)) });
+            } catch ( error ) {
+                this.log.error('Error fetching models:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
 
         // Endpoint to get detailed information about available AI chat models
-        Endpoint({
-            route: '/chat/models/details',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    // Use SUService to access AIChatService as system user
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const svc_aiChat = this.services.get('ai-chat');
-                        // Return the detailed model list which includes cost and capability information
-                        return svc_aiChat.models();
-                    });
+        router.use(eggspress('/chat/models/details', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                // Use SUService to access AIChatService as system user
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_aiChat = this.services.get('ai-chat');
+                    // Return the detailed model list which includes cost and capability information
+                    return svc_aiChat.models();
+                });
 
-                    // Return the detailed list of models
-                    res.json({ models: models.filter((e) => !['costly', 'fake', 'abuse', 'model-fallback-test-1'].includes(e.id)) });
-                } catch ( error ) {
-                    this.log.error('Error fetching model details:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+                // Return the detailed list of models
+                res.json({ models: models.filter(e => !['costly', 'fake', 'abuse', 'model-fallback-test-1'].includes(e.id)) });
+            } catch ( error ) {
+                this.log.error('Error fetching model details:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
 
-        Endpoint({
-            route: '/image/models',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    // Use SUService to access AIImageGenerationService as system user
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const svc_imageGen = this.services.get('ai-image');
-                        // Return the simple model list which contains basic model information
-                        return svc_imageGen.list();
-                    });
-                    // Return the list of models
-                    res.json({ models });
-                } catch ( error ) {
-                    this.log.error('Error fetching image models:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+        router.use(eggspress('/image/models', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                // Use SUService to access AIImageGenerationService as system user
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_imageGen = this.services.get('ai-image');
+                    // Return the simple model list which contains basic model information
+                    return svc_imageGen.list();
+                });
+                // Return the list of models
+                res.json({ models });
+            } catch ( error ) {
+                this.log.error('Error fetching image models:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
 
-        Endpoint({
-            route: '/image/models/details',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    // Use SUService to access AIImageGenerationService as system user
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const svc_imageGen = this.services.get('ai-image');
-                        // Return the detailed model list which includes cost and capability information
-                        return svc_imageGen.models();
-                    });
-                    // Return the detailed list of models
-                    res.json({ models });
-                } catch ( error ) {
-                    this.log.error('Error fetching image model details:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+        router.use(eggspress('/image/models/details', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                // Use SUService to access AIImageGenerationService as system user
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_imageGen = this.services.get('ai-image');
+                    // Return the detailed model list which includes cost and capability information
+                    return svc_imageGen.models();
+                });
+                // Return the detailed list of models
+                res.json({ models });
+            } catch ( error ) {
+                this.log.error('Error fetching image model details:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
 
-        Endpoint({
-            route: '/video/models/details',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const items = [];
-                        if ( this.services.has('openai-video-generation') ) {
-                            const svc_video = this.services.get('openai-video-generation');
-                            if ( typeof svc_video.models === 'function' ) {
-                                items.push(...await svc_video.models());
-                            }
-                        }
-                        if ( this.services.has('together-video-generation') ) {
-                            const svc_video = this.services.get('together-video-generation');
-                            if ( typeof svc_video.models === 'function' ) {
-                                items.push(...await svc_video.models());
-                            }
-                        }
-                        return items;
-                    });
-                    res.json({ models });
-                } catch ( error ) {
-                    this.log.error('Error fetching video model details:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+        router.use(eggspress('/video/models/details', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_video = this.services.get('ai-video');
+                    return svc_video.models();
+                });
+                res.json({ models });
+            } catch ( error ) {
+                this.log.error('Error fetching video model details:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
 
-        Endpoint({
-            route: '/video/models',
-            methods: ['GET'],
-            handler: async (req, res) => {
-                try {
-                    const svc_su = this.services.get('su');
-                    const models = await svc_su.sudo(async () => {
-                        const items = [];
-                        if ( this.services.has('openai-video-generation') ) {
-                            const svc_video = this.services.get('openai-video-generation');
-                            if ( typeof svc_video.models === 'function' ) {
-                                items.push(...(await svc_video.models()).map(model => model.puterId || model.id));
-                            }
-                        }
-                        if ( this.services.has('together-video-generation') ) {
-                            const svc_video = this.services.get('together-video-generation');
-                            if ( typeof svc_video.models === 'function' ) {
-                                items.push(...(await svc_video.models()).map(model => model.id));
-                            }
-                        }
-                        return items;
-                    });
-                    res.json({ models });
-                } catch ( error ) {
-                    this.log.error('Error fetching video models:', error);
-                    throw APIError.create('internal_server_error');
-                }
-            },
-        }).attach(router);
+        router.use(eggspress('/video/models', {
+            allowedMethods: ['GET'],
+        }, async (req, res) => {
+            try {
+                const svc_su = this.services.get('su');
+                const models = await svc_su.sudo(async () => {
+                    const svc_video = this.services.get('ai-video');
+                    return svc_video.list();
+                });
+                res.json({ models });
+            } catch ( error ) {
+                this.log.error('Error fetching video models:', error);
+                throw APIError.create('internal_server_error');
+            }
+        }));
     }
 }
 

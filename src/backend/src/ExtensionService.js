@@ -18,8 +18,8 @@
  */
 
 const { AdvancedBase } = require('@heyputer/putility');
+const eggspress = require('./api/eggspress');
 const BaseService = require('./services/BaseService');
-const { Endpoint } = require('./util/expressutil');
 const configurable_auth = require('./middleware/configurable_auth');
 const { Context } = require('./util/context');
 const { DB_WRITE } = require('./services/database/consts');
@@ -58,16 +58,14 @@ class ExtensionServiceState extends AdvancedBase {
             mw.push(configurable_auth(auth_conf));
         }
 
-        const endpoint = Endpoint({
-            methods: options.methods ?? ['GET'],
+        const router = eggspress(path, {
+            allowedMethods: options.methods ?? ['GET'],
             mw,
-            route: path,
-            handler: handler,
             ...(options.subdomain ? { subdomain: options.subdomain } : {}),
             otherOpts: options.otherOpts || {},
-        });
+        }, handler);
 
-        this.expressThings_.push({ type: 'endpoint', value: endpoint });
+        this.expressThings_.push({ type: 'router', value: [router] });
     }
 }
 
@@ -85,7 +83,8 @@ class ExtensionService extends BaseService {
 
         this.state.values.set('services', this.services);
         this.state.values.set('log_context', this.services.get('log-service').create(
-                        this.state.extension.name));
+            this.state.extension.name,
+        ));
 
         // Create database access object for extension
         const db = this.services.get('database').get(DB_WRITE, 'extension');
@@ -153,7 +152,7 @@ class ExtensionService extends BaseService {
         this.state.extension.emit('preinit');
     }
 
-    async ['__on_boot.consolidation'] (...a) {
+    async '__on_boot.consolidation' () {
         const svc_su = this.services.get('su');
         await svc_su.sudo(async () => {
             await this.state.extension.emit('init', {}, {
@@ -161,7 +160,7 @@ class ExtensionService extends BaseService {
             });
         });
     }
-    async ['__on_boot.activation'] (...a) {
+    async '__on_boot.activation' () {
         const svc_su = this.services.get('su');
         await svc_su.sudo(async () => {
             await this.state.extension.emit('activate', {}, {
@@ -169,7 +168,7 @@ class ExtensionService extends BaseService {
             });
         });
     }
-    async ['__on_boot.ready'] (...a) {
+    async '__on_boot.ready' () {
         const svc_su = this.services.get('su');
         await svc_su.sudo(async () => {
             await this.state.extension.emit('ready', {}, {
@@ -178,13 +177,8 @@ class ExtensionService extends BaseService {
         });
     }
 
-    ['__on_install.routes'] (_, { app }) {
-        if ( ! this.state ) debugger;
+    '__on_install.routes' (_, { app }) {
         for ( const thing of this.state.expressThings_ ) {
-            if ( thing.type === 'endpoint' ) {
-                thing.value.attach(app);
-                continue;
-            }
             if ( thing.type === 'router' ) {
                 app.use(...thing.value);
                 continue;

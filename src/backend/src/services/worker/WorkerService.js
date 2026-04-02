@@ -18,7 +18,6 @@
  */
 
 const configurable_auth = require('../../middleware/configurable_auth');
-const { Endpoint } = require('../../util/expressutil');
 const BaseService = require('../BaseService');
 const fs = require('node:fs');
 
@@ -147,43 +146,49 @@ class WorkerService extends BaseService {
 
                     // Send user the appropriate notification
                     if ( cfData.success ) {
-                        svc_notification.notify(UsernameNotifSelector(actor.type.user.username),
-                                        {
-                                            source: 'worker',
-                                            title: `Succesfully deployed ${cfData.url}`,
-                                            template: 'user-requesting-share',
-                                            fields: {
-                                                username: actor.type.user.username,
-                                            },
-                                        });
+                        svc_notification.notify(
+                            UsernameNotifSelector(actor.type.user.username),
+                            {
+                                source: 'worker',
+                                title: `Succesfully deployed ${cfData.url}`,
+                                template: 'user-requesting-share',
+                                fields: {
+                                    username: actor.type.user.username,
+                                },
+                            },
+                        );
                     } else {
-                        svc_notification.notify(UsernameNotifSelector(actor.type.user.username),
-                                        {
-                                            source: 'worker',
-                                            title: `Failed to deploy ${workerName}! ${cfData.errors}`,
-                                            template: 'user-requesting-share',
-                                            fields: {
-                                                username: actor.type.user.username,
-                                            },
-                                        });
+                        svc_notification.notify(
+                            UsernameNotifSelector(actor.type.user.username),
+                            {
+                                source: 'worker',
+                                title: `Failed to deploy ${workerName}! ${cfData.errors}`,
+                                template: 'user-requesting-share',
+                                fields: {
+                                    username: actor.type.user.username,
+                                },
+                            },
+                        );
                     }
 
                 } catch (e) {
-                    svc_notification.notify(UsernameNotifSelector(actor.type.user.username),
-                                    {
-                                        source: 'worker',
-                                        title: `Failed to deploy ${workerName}!!\n ${e}`,
-                                        template: 'user-requesting-share',
-                                        fields: {
-                                            username: actor.type.user.username,
-                                        },
-                                    });
+                    svc_notification.notify(
+                        UsernameNotifSelector(actor.type.user.username),
+                        {
+                            source: 'worker',
+                            title: `Failed to deploy ${workerName}!!\n ${e}`,
+                            template: 'user-requesting-share',
+                            fields: {
+                                username: actor.type.user.username,
+                            },
+                        },
+                    );
                 }
             }
         });
     }
     static IMPLEMENTS = {
-        ['workers']: {
+        'workers': {
             /**
              *
              * @param {{filePath: string, workerName: string, authorization: string}} param0
@@ -333,7 +338,7 @@ class WorkerService extends BaseService {
             },
         },
     };
-    async ['__on_driver.register.interfaces'] () {
+    async '__on_driver.register.interfaces' () {
         const svc_registry = this.services.get('registry');
         const col_interfaces = svc_registry.get('interfaces');
 

@@ -11,16 +11,6 @@ const normalizeTTSProvider = (value) => {
     return value;
 };
 
-const TOGETHER_VIDEO_MODEL_PREFIXES = [
-    'minimax/',
-    'google/',
-    'bytedance/',
-    'pixverse/',
-    'kwaivgi/',
-    'vidu/',
-    'wan-ai/',
-];
-
 class AI {
     /**
      * Creates a new instance with the given authentication token, API origin, and app ID,
@@ -657,36 +647,37 @@ class AI {
             requestParams = { messages: [{ content: args[0] }] };
         }
 
-        // ai.chat(prompt, imageURL/File)
-        // ai.chat(prompt, imageURL/File, testMode)
+        // ai.chat(prompt, mediaURL/File)
+        // ai.chat(prompt, mediaURL/File, testMode)
         else if ( typeof args[0] === 'string' && (typeof args[1] === 'string' || args[1] instanceof File) ) {
-            // if imageURL is a File, transform it to a data URI
+            // if mediaURL is a File, transform it to a data URI
             if ( args[1] instanceof File ) {
                 args[1] = await utils.blobToDataUri(args[1]);
             }
 
-            // parse args[1] as an image_url object
+            const mediaBlock = utils.isVideoInput(args[1])
+                ? { video_url: { url: args[1] } }
+                : { image_url: { url: args[1] } };
+
             requestParams = {
                 vision: true,
                 messages: [
                     {
                         content: [
                             args[0],
-                            {
-                                image_url: {
-                                    url: args[1],
-                                },
-                            },
+                            mediaBlock,
                         ],
                     },
                 ],
             };
         }
-        // chat(prompt, [imageURLs])
+        // chat(prompt, [mediaURLs])
         else if ( typeof args[0] === 'string' && Array.isArray(args[1]) ) {
-            // parse args[1] as an array of image_url objects
             for ( let i = 0; i < args[1].length; i++ ) {
-                args[1][i] = { image_url: { url: args[1][i] } };
+                const url = args[1][i];
+                args[1][i] = utils.isVideoInput(url)
+                    ? { video_url: { url } }
+                    : { image_url: { url } };
             }
             requestParams = {
                 vision: true,
@@ -908,39 +899,19 @@ class AI {
             throw ({ message: 'Prompt parameter is required', code: 'prompt_required' });
         }
 
-        if ( ! options.model ) {
-            options.model = 'sora-2';
-        }
-
         if ( options.duration !== undefined && options.seconds === undefined ) {
             options.seconds = options.duration;
         }
 
-        // This sucks, should be backend's job like we do for chat models now
-        let videoService = 'openai-video-generation';
+        if ( options.test_mode === true ) {
+            testMode = true;
+        }
+
+        let videoService = 'ai-video';
         const driverHint = typeof options.driver === 'string' ? options.driver : undefined;
-        const driverHintLower = driverHint ? driverHint.toLowerCase() : undefined;
-        const providerRaw = typeof options.provider === 'string'
-            ? options.provider
-            : (typeof options.service === 'string' ? options.service : undefined);
-        const providerHint = typeof providerRaw === 'string' ? providerRaw.toLowerCase() : undefined;
-        const modelLower = typeof options.model === 'string' ? options.model.toLowerCase() : '';
 
-        const looksLikeTogetherVideoModel = typeof options.model === 'string' &&
-            (TOGETHER_VIDEO_MODEL_PREFIXES.some(prefix => modelLower.startsWith(prefix)) || options.model.startsWith('togetherai:'));
-
-        if ( driverHintLower === 'together' || driverHintLower === 'together-ai' ) {
-            videoService = 'together-video-generation';
-        } else if ( driverHintLower === 'together-video-generation' ) {
-            videoService = 'together-video-generation';
-        } else if ( driverHintLower === 'openai' ) {
-            videoService = 'openai-video-generation';
-        } else if ( driverHint ) {
+        if ( driverHint ) {
             videoService = driverHint;
-        } else if ( providerHint === 'together' || providerHint === 'together-ai' ) {
-            videoService = 'together-video-generation';
-        } else if ( looksLikeTogetherVideoModel ) {
-            videoService = 'together-video-generation';
         }
 
         return await utils.make_driver_method(['prompt'], 'puter-video-generation', videoService, 'generate', {

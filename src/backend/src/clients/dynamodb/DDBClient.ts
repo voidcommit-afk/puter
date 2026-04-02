@@ -1,5 +1,5 @@
 import { CreateTableCommand, CreateTableCommandInput, DynamoDBClient, UpdateTimeToLiveCommand } from '@aws-sdk/client-dynamodb';
-import { BatchGetCommand, BatchGetCommandInput, DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { BatchGetCommand, BatchGetCommandInput, BatchWriteCommand, BatchWriteCommandInput, DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import dynalite from 'dynalite';
 import { once } from 'node:events';
@@ -14,6 +14,61 @@ interface DBClientConfig {
     path?: string,
     endpoint?: string
 }
+
+const LOCAL_DYNAMO_PATH_KEY = ':memory:';
+const localDynaliteEndpointPromises = new Map<string, Promise<string>>();
+const MAX_BATCH_WRITE_ITEMS = 25;
+const MAX_BATCH_WRITE_RETRIES = 8;
+const BATCH_WRITE_RETRY_BASE_MS = 25;
+
+const getDynalitePathKey = (path?: string) => {
+    if ( path === ':memory:' ) return LOCAL_DYNAMO_PATH_KEY;
+    return path || './puter-ddb';
+};
+
+const getOrCreateLocalDynaliteEndpoint = async (pathKey: string) => {
+    let endpointPromise = localDynaliteEndpointPromises.get(pathKey);
+    if ( endpointPromise ) return endpointPromise;
+
+    endpointPromise = (async () => {
+        const dynaliteOptions = pathKey === LOCAL_DYNAMO_PATH_KEY
+            ? { createTableMs: 0 }
+            : { createTableMs: 0, path: pathKey };
+
+        const dynaliteInstance = dynalite(dynaliteOptions);
+        const dynaliteServer = dynaliteInstance.listen(0, '127.0.0.1');
+        // Don't keep test workers alive just because dynalite is still open.
+        dynaliteServer.unref?.();
+        await once(dynaliteServer, 'listening');
+
+        const address = dynaliteServer.address();
+        const port = (typeof address === 'object' && address ? address.port : undefined) || 4567;
+        return `http://127.0.0.1:${port}`;
+    })();
+
+    localDynaliteEndpointPromises.set(pathKey, endpointPromise);
+    endpointPromise.catch(() => {
+        if ( localDynaliteEndpointPromises.get(pathKey) === endpointPromise ) {
+            localDynaliteEndpointPromises.delete(pathKey);
+        }
+    });
+    return endpointPromise;
+};
+
+const chunkValues = <T>(values: T[], size: number): T[][] => {
+    if ( values.length === 0 ) {
+        return [];
+    }
+    const chunks: T[][] = [];
+    for ( let index = 0; index < values.length; index += size ) {
+        chunks.push(values.slice(index, index + size));
+    }
+    return chunks;
+};
+
+const sleep = async (ms: number) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+};
 
 export class DDBClient {
     ddbClientPromise: Promise<DynamoDBClient>;
@@ -42,12 +97,8 @@ export class DDBClient {
     async #getClient () {
         if ( ! this.config?.aws ) {
             console.warn('No config for DynamoDB, will fall back on local dynalite');
-            const dynaliteInstance = dynalite({ createTableMs: 0, path: this.config?.path === ':memory:' ? undefined : this.config?.path || './puter-ddb' });
-            const dynaliteServer = dynaliteInstance.listen(0, '127.0.0.1');
-            await once(dynaliteServer, 'listening');
-            const address = dynaliteServer.address();
-            const port = (typeof address === 'object' && address ? address.port : undefined) || 4567;
-            const dynamoEndpoint = `http://127.0.0.1:${port}`;
+            const pathKey = getDynalitePathKey(this.config?.path);
+            const dynamoEndpoint = await getOrCreateLocalDynaliteEndpoint(pathKey);
 
             const client =  new DynamoDBClient({
                 credentials: {
@@ -63,7 +114,7 @@ export class DDBClient {
                 endpoint: dynamoEndpoint,
                 region: 'us-west-2',
             });
-            console.log(`DynamoDB client created with region ${await client.config.region()}`);
+            console.log(`Dynalite client created within instance for region: ${await client.config.region()}`);
             return client;
         }
 
@@ -81,7 +132,7 @@ export class DDBClient {
             ...(this.config.endpoint ? { endpoint: this.config.endpoint } : {}),
             region: this.config.aws.region || 'us-west-2',
         });
-        console.log(`Dynalite DynamoDB client created with region ${await client.config.region()}`);
+        console.log(`DynamoDB client created with region ${await client.config.region()}`);
         return client;
     }
 
@@ -117,15 +168,17 @@ export class DDBClient {
             return acc;
         }, {} as Record<string, Record<string, unknown>[]>);
 
-        const RequestItems: BatchGetCommandInput['RequestItems'] = Object.entries(allRequestItemsPerTable).reduce((acc, [table, keyList]) => {
-            const Keys = keyList;
-            acc[table] = {
-                Keys,
-                ConsistentRead: consistentRead,
-            };
-            return acc;
-        },
-        {} as NonNullable<BatchGetCommandInput['RequestItems']>);
+        const RequestItems: BatchGetCommandInput['RequestItems'] = Object.entries(allRequestItemsPerTable).reduce(
+            (acc, [table, keyList]) => {
+                const Keys = keyList;
+                acc[table] = {
+                    Keys,
+                    ConsistentRead: consistentRead,
+                };
+                return acc;
+            },
+            {} as NonNullable<BatchGetCommandInput['RequestItems']>,
+        );
 
         const command = new BatchGetCommand({
             RequestItems,
@@ -133,6 +186,84 @@ export class DDBClient {
         });
 
         return this.#documentClient.send(command);
+    }
+
+    async batchPut (params: { table: string, item: Record<string, unknown> }[]) {
+        const consumedCapacityByTable = new Map<string, number>();
+        if ( params.length === 0 ) {
+            return { ConsumedCapacity: [] };
+        }
+
+        const accumulateConsumedCapacity = (
+            consumedCapacityEntries: Array<{ TableName?: string; CapacityUnits?: number }> | undefined,
+        ) => {
+            if ( ! consumedCapacityEntries ) {
+                return;
+            }
+            for ( const consumedCapacityEntry of consumedCapacityEntries ) {
+                const table = consumedCapacityEntry.TableName;
+                if ( ! table ) {
+                    continue;
+                }
+
+                const existingUsage = consumedCapacityByTable.get(table) ?? 0;
+                consumedCapacityByTable.set(
+                    table,
+                    existingUsage + Number(consumedCapacityEntry.CapacityUnits ?? 0),
+                );
+            }
+        };
+
+        const chunks = chunkValues(params, MAX_BATCH_WRITE_ITEMS);
+        for ( const chunk of chunks ) {
+            let requestItems = chunk.reduce((acc, curr) => {
+                const tableRequests = acc[curr.table] ?? [];
+                tableRequests.push({
+                    PutRequest: {
+                        Item: curr.item,
+                    },
+                });
+                acc[curr.table] = tableRequests;
+                return acc;
+            }, {} as NonNullable<BatchWriteCommandInput['RequestItems']>);
+
+            for ( let attempt = 0; attempt <= MAX_BATCH_WRITE_RETRIES; attempt++ ) {
+                if ( Object.keys(requestItems).length === 0 ) {
+                    break;
+                }
+
+                const response = await this.#documentClient.send(new BatchWriteCommand({
+                    RequestItems: requestItems,
+                    ReturnConsumedCapacity: 'TOTAL',
+                }));
+                accumulateConsumedCapacity(
+                    response.ConsumedCapacity as Array<{ TableName?: string; CapacityUnits?: number }> | undefined,
+                );
+
+                const unprocessedItems = response.UnprocessedItems ?? {};
+                if ( Object.keys(unprocessedItems).length === 0 ) {
+                    requestItems = {};
+                    break;
+                }
+
+                requestItems = unprocessedItems as NonNullable<BatchWriteCommandInput['RequestItems']>;
+                if ( attempt < MAX_BATCH_WRITE_RETRIES ) {
+                    const delayMs = Math.min(1000, BATCH_WRITE_RETRY_BASE_MS * (2 ** attempt));
+                    await sleep(delayMs);
+                }
+            }
+
+            if ( Object.keys(requestItems).length > 0 ) {
+                throw new Error('Failed to batch write all items to DynamoDB');
+            }
+        }
+
+        return {
+            ConsumedCapacity: Array.from(consumedCapacityByTable.entries()).map(([TableName, CapacityUnits]) => ({
+                TableName,
+                CapacityUnits,
+            })),
+        };
     }
 
     async del<T extends Record<string, unknown>> (table: string, key: T) {

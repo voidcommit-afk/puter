@@ -18,13 +18,14 @@
  */
 const APIError = require('../../api/APIError');
 const FSNodeParam = require('../../api/filesystem/FSNodeParam');
+const eggspress = require('../../api/eggspress');
 const { NodePathSelector } = require('../../filesystem/node/selectors');
 const { get_user } = require('../../helpers');
 const configurable_auth = require('../../middleware/configurable_auth');
 const { Context } = require('../../util/context');
-const { Endpoint } = require('../../util/expressutil');
-const BaseService = require('../BaseService');
+const { BaseService } = require('../BaseService');
 const { AppUnderUserActorType, UserActorType, Actor, SystemActorType, AccessTokenActorType } = require('./Actor');
+const { DB_READ } = require('../database/consts');
 const { MANAGE_PERM_PREFIX } = require('./permissionConts.mjs');
 const { PermissionUtil } = require('./permissionUtils.mjs');
 
@@ -66,7 +67,6 @@ class ACLService extends BaseService {
     * @returns {Promise<boolean>} True if access is allowed, false otherwise
     */
     async check (actor, resource, mode) {
-        const ld = (Context.get('logdent') ?? 0) + 1;
         /**
         * Checks if an actor has permission for a specific mode on a resource
         *
@@ -75,18 +75,7 @@ class ACLService extends BaseService {
         * @param {('see'| 'list'| 'read'| 'write' | 'manage')} mode - The permission mode to check ('see', 'list', 'read', 'write', 'manage')
         * @returns {Promise<boolean>} True if actor has permission, false otherwise
         */
-        return await Context.get().sub({ logdent: ld }).arun(async () => {
-            const result =  await this._check_fsNode(actor, resource, mode);
-            if ( this.verbose ) {
-                console.log('LOGGING ACL CHECK', {
-                    actor,
-                    mode,
-                    // trace: (new Error()).stack,
-                    result,
-                });
-            }
-            return result;
-        });
+        return await this._check_fsNode(actor, resource, mode);
     }
 
     /**
@@ -100,7 +89,7 @@ class ACLService extends BaseService {
     * @returns {Promise<boolean>} True if actor has permission, false otherwise
     * @private
     */
-    async ['__on_install.routes'] (_, { app }) {
+    async '__on_install.routes' (_, { app }) {
         /**
         * Handles route installation for ACL service endpoints.
         * Sets up routes for user-to-user permission management including:
@@ -120,85 +109,81 @@ class ACLService extends BaseService {
 
         app.use('/acl', r_acl);
 
-        Endpoint({
-            route: '/stat-user-user',
-            methods: ['POST'],
+        r_acl.use(eggspress('/stat-user-user', {
+            allowedMethods: ['POST'],
             mw: [configurable_auth()],
-            handler: async (req, res) => {
-                // Only user actor is allowed
-                if ( ! (req.actor.type instanceof UserActorType) ) {
-                    return res.status(403).json({
-                        error: 'forbidden',
-                    });
-                }
+        }, async (req, res) => {
+            // Only user actor is allowed
+            if ( ! (req.actor.type instanceof UserActorType) ) {
+                return res.status(403).json({
+                    error: 'forbidden',
+                });
+            }
 
-                const holder_user = await get_user({
+            const holder_user = await get_user({
+                username: req.body.user,
+            });
+
+            if ( ! holder_user ) {
+                throw APIError.create('user_does_not_exist', null, {
                     username: req.body.user,
                 });
+            }
 
-                if ( ! holder_user ) {
-                    throw APIError.create('user_does_not_exist', null, {
-                        username: req.body.user,
-                    });
-                }
+            const issuer = req.actor;
+            const holder = new Actor({
+                type: new UserActorType({
+                    user: holder_user,
+                }),
+            });
 
-                const issuer = req.actor;
-                const holder = new Actor({
-                    type: new UserActorType({
-                        user: holder_user,
-                    }),
-                });
+            const node = await (new FSNodeParam('path')).consolidate({
+                req,
+                getParam: () => req.body.resource,
+            });
 
-                const node = await (new FSNodeParam('path')).consolidate({
-                    req,
-                    getParam: () => req.body.resource,
-                });
+            const permissions = await this.stat_user_user(issuer, holder, node);
 
-                const permissions = await this.stat_user_user(issuer, holder, node);
+            res.json({ permissions });
+        }));
 
-                res.json({ permissions });
-            },
-        }).attach(r_acl);
-
-        Endpoint({
-            route: '/set-user-user',
-            methods: ['POST'],
+        r_acl.use(eggspress('/set-user-user', {
+            allowedMethods: ['POST'],
             mw: [configurable_auth()],
-            handler: async (req, res) => {
-                // Only user actor is allowed
-                if ( ! (req.actor.type instanceof UserActorType) ) {
-                    return res.status(403).json({
-                        error: 'forbidden',
-                    });
-                }
+        }, async (req, res) => {
+            // Only user actor is allowed
+            if ( ! (req.actor.type instanceof UserActorType) ) {
+                return res.status(403).json({
+                    error: 'forbidden',
+                });
+            }
 
-                const holder_user = await get_user({
+            const holder_user = await get_user({
+                username: req.body.user,
+            });
+
+            if ( ! holder_user ) {
+                throw APIError.create('user_does_not_exist', null, {
                     username: req.body.user,
                 });
+            }
 
-                if ( ! holder_user ) {
-                    throw APIError.create('user_does_not_exist', null, {
-                        username: req.body.user,
-                    });
-                }
+            const issuer = req.actor;
+            const holder = new Actor({
+                type: new UserActorType({
+                    user: holder_user,
+                }),
+            });
 
-                const issuer = req.actor;
-                const holder = new Actor({
-                    type: new UserActorType({
-                        user: holder_user,
-                    }),
-                });
+            const node = await (new FSNodeParam('path')).consolidate({
+                req,
+                getParam: () => req.body.resource,
+            });
 
-                const node = await (new FSNodeParam('path')).consolidate({
-                    req,
-                    getParam: () => req.body.resource,
-                });
+            await this.set_user_user(issuer, holder, node, req.body.mode, req.body.options ?? {});
 
-                await this.set_user_user(issuer, holder, node, req.body.mode, req.body.options ?? {});
-
-                res.json({});
-            },
-        }).attach(r_acl);
+            res.json({});
+        }));
     }
 
     /**
@@ -422,11 +407,40 @@ class ACLService extends BaseService {
             if ( is_public ) return true;
         }
 
-        // Access tokens only work if the authorizer has permission
+        // Access tokens: allow if token has permission via DB and authorizer has permission
         if ( actor.type instanceof AccessTokenActorType ) {
-            const authorizer = actor.type.authorizer;
+            const { authorizer, token } = actor.type;
             const authorizer_perm = await this._check_fsNode(authorizer, fsNode, mode);
             if ( ! authorizer_perm ) return false;
+
+            // We check access token permissions manually here and skip PermissionService
+            const db = this.services.get('database').get(DB_READ, 'auth');
+            let perm_fsNode = fsNode;
+
+            // Iterate up the directory tree (towards root directory)
+            while ( !(await perm_fsNode.get('is-root')) ) {
+                const uid = await perm_fsNode.get('uid');
+                // DRY: second occurance of this code
+                const permission = mode === MANAGE_PERM_PREFIX
+                    ? PermissionUtil.join(MANAGE_PERM_PREFIX, 'fs', uid)
+                    : PermissionUtil.join('fs', uid, mode);
+                const rows = await db.read(
+                    'SELECT * FROM `access_token_permissions` WHERE `token_uid` = ? AND `permission` = ?',
+                    [token, permission],
+                );
+
+                // We already checked that the authorizer has the required permission,
+                // so if the access token has the required permission as well we can
+                // return true immediately.
+                if ( rows[0] ) return true;
+
+                // ...iterate
+                perm_fsNode = await perm_fsNode.getParent();
+            }
+
+            // If we reach here, the authorizer has permission to access the requested
+            // file/directory but the access token does not
+            return false;
         }
 
         // Hard rule: if app-under-user is accessing appdata directory, allow

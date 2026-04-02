@@ -56,6 +56,12 @@ const examples = [
                 source: '/playground/examples/ai-gpt-vision.html',
             },
             {
+                title: 'Video Analysis',
+                description: 'Analyze videos with AI using Puter.js. Run and modify this video analysis example instantly in your browser.',
+                slug: 'ai-video-analysis',
+                source: '/playground/examples/ai-video-analysis.html',
+            },
+            {
                 title: 'Stream the response',
                 description: 'Stream AI chat responses in real-time with Puter.js. Run and experiment with this streaming example in the playground.',
                 slug: 'ai-chat-stream',
@@ -96,6 +102,12 @@ const examples = [
                 description: 'Chat with Claude Sonnet using Puter.js AI API. Run and experiment with this example directly in the playground.',
                 slug: 'ai-chat-claude',
                 source: '/playground/examples/ai-chat-claude.html',
+            },
+            {
+                title: 'Prompt caching with Claude',
+                description: 'Reduce time and costs with Claude prompt caching using Puter.js AI API. Try AI examples directly in Puter.js playground.',
+                slug: 'ai-claude-cache-control',
+                source: '/playground/examples/ai-claude-cache-control.html',
             },
             {
                 title: 'Chat with DeepSeek',
@@ -168,6 +180,12 @@ const examples = [
                 description: 'Generate speech with ElevenLabs voices using Puter.js AI API. Run and experiment with this TTS example in the playground.',
                 slug: 'ai-txt2speech-elevenlabs',
                 source: '/playground/examples/ai-txt2speech-elevenlabs.html',
+            },
+            {
+                title: 'Voice Changer',
+                description: 'Swap a sample clip into a new voice using Puter.js AI speech-to-speech helpers.',
+                slug: 'ai-voice-changer',
+                source: '/playground/examples/ai-voice-changer.html',
             },
             {
                 title: 'ElevenLabs Voice changer with a sample clip',
@@ -390,6 +408,18 @@ const examples = [
                 source: '/playground/examples/kv-list.html',
             },
             {
+                title: 'List (Sorted)',
+                description: 'See how keys are returned in lexicographic order with puter.kv.list(). Run and modify this example in the playground.',
+                slug: 'kv-list-sort',
+                source: '/playground/examples/kv-list-sort.html',
+             },
+             {
+                title: 'List (Zero-Padding)',
+                description: 'Learn how to sort numeric keys correctly by zero-padding. Run and experiment with this example in the playground.',
+                slug: 'kv-list-padding',
+                source: '/playground/examples/kv-list-padding.html',
+             },
+            {
                 title: 'Flush',
                 description: 'Clear all data with Puter.js key-value API. Run and experiment with this flush example in the playground.',
                 slug: 'kv-flush',
@@ -435,6 +465,17 @@ const examples = [
                 description: 'Make HTTP requests with Puter.js fetch API. Run and experiment with this example directly in the playground.',
                 slug: 'net-fetch',
                 source: '/playground/examples/net-fetch.html',
+            },
+        ],
+    },
+    {
+        title: 'Peer',
+        children: [
+            {
+                title: 'Peer Chat',
+                description: 'Create a peer-to-peer data channel with Puter.js. Run and experiment with this example directly in the playground.',
+                slug: 'peer-basic',
+                source: '/playground/examples/peer-basic.html',
             },
         ],
     },

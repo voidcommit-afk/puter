@@ -14,8 +14,8 @@ import { toMicroCents } from './utils.js';
  */
 export class MeteringService {
 
-    static GLOBAL_SHARD_COUNT = 1000; // number of global usage shards to spread writes across
-    static APP_SHARD_COUNT = 1000; // number of app usage shards to spread writes across
+    static GLOBAL_SHARD_COUNT = 10000; // number of global usage shards to spread writes across
+    static APP_SHARD_COUNT = 10000; // number of app usage shards to spread writes across
     static MAX_GLOBAL_USAGE_PER_MINUTE = toMicroCents(.2); // 20 cents per minute max global usage to help detect abuse
     #kvStore: DynamoKVStore;
     #superUserService: SUService;
@@ -28,12 +28,12 @@ export class MeteringService {
         this.#eventService = eventService;
         setInterval(() => {
             this.#checkRateOfChange();
-        }, 1000 * 60 * 5); // check every 5 minutes
+        }, 1000 * 60 * 16); // check every 16 minutes
     }
 
     utilRecordUsageObject<T extends Record<string, number>>(trackedUsageObject: T, actor: Actor, modelPrefix: string, costsOverrides?: Partial<Record<keyof T, number>>) {
         this.batchIncrementUsages(actor, Object.entries(trackedUsageObject).map(([usageKind, amount]) => {
-            const hasOverride = !!costsOverrides && Object.prototype.hasOwnProperty.call(costsOverrides, usageKind);
+            const hasOverride = !!costsOverrides && Number.isFinite(costsOverrides[usageKind]);
             return {
                 usageType: `${modelPrefix}:${usageKind}`,
                 usageAmount: amount,
@@ -68,6 +68,24 @@ export class MeteringService {
     // TODO DS: track daily and hourly usage as well
     async incrementUsage (actor: Actor, usageType: (keyof typeof COST_MAPS) | (string & {}), usageAmount: number, costOverride?: number) {
         usageAmount = usageAmount < 0 ? 1 : usageAmount;
+
+        const costOverrideRaw = costOverride;
+        costOverride = !Number.isFinite(costOverride)
+            ? undefined
+            : (costOverride as number) < 0
+                ? 1
+                : costOverride;
+
+        if ( costOverrideRaw && costOverrideRaw < 0 ) {
+            this.#alarmService.create(`metering unexpected negative cost access to: ${usageType}`, 'negative cost abuse vector!', {
+                userId: actor.type?.user?.uuid,
+                username: actor.type?.user?.username,
+                appId: actor.type?.app?.uid,
+                usageType,
+                usageAmount,
+                costOverride,
+            });
+        }
         try {
             if ( !usageAmount || !usageType || !actor ) {
                 // silent fail for now;
@@ -100,7 +118,7 @@ export class MeteringService {
 
                 usageType = usageType.replace(/\./g, PERIOD_ESCAPE) as keyof typeof COST_MAPS; // replace dots with underscores for kvstore paths, TODO DS: map this back when reading
                 const appId = actor.type?.app?.uid || GLOBAL_APP_KEY;
-                const userId = actor.type?.user.uuid;
+                const userId = actor.type?.user?.uuid!;
                 const pathAndAmountMap = {
                     'total': totalCost,
                     [`${usageType}.units`]: usageAmount,
@@ -119,7 +137,7 @@ export class MeteringService {
                     key: puterConsumptionKey,
                     pathAndAmountMap,
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'puterConsumptionKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'puterConsumptionKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const actorAppUsageKey = `${METRICS_PREFIX}:actor:${userId}:app:${appId}:${currentMonth}`;
@@ -127,7 +145,7 @@ export class MeteringService {
                     key: actorAppUsageKey,
                     pathAndAmountMap,
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'actorAppUsageKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'actorAppUsageKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 if ( appId !== GLOBAL_APP_KEY ) {
@@ -136,7 +154,7 @@ export class MeteringService {
                         key: appUsageKey,
                         pathAndAmountMap,
                     }).catch((e: Error) => {
-                        console.warn('Failed to increment aux usage data \'appUsageKey\' with error: ', e);
+                        console.warn(`Failed to increment aux usage data 'appUsageKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                     });
                 }
 
@@ -148,7 +166,7 @@ export class MeteringService {
                         [`${appId}.count`]: 1,
                     },
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'actorAppTotalsKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'actorAppTotalsKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const lastUpdatedKey = `${METRICS_PREFIX}:actor:${userId}:lastUpdated`;
@@ -156,7 +174,7 @@ export class MeteringService {
                     key: lastUpdatedKey,
                     value: Date.now(),
                 }).catch((e: Error) => {
-                    console.warn('Failed to set lastUpdatedKey with error: ', e);
+                    console.warn('Failed to set lastUpdatedKey with error: ', e.message);
                 });
 
                 // update addon usage if we are over the allowance
@@ -199,7 +217,7 @@ export class MeteringService {
             });
         } catch ( e ) {
             console.error('Metering: Failed to increment usage for actor', actor, 'usageType', usageType, 'usageAmount', usageAmount, e);
-            this.#alarmService.create(`metering service error for user: ${ actor.type?.user?.username} app: ${ actor.type.app.uid}`, (e as Error).message, {
+            this.#alarmService.create(`metering service error for user: ${ actor.type?.user?.username} app: ${ actor.type.app?.uid}`, (e as Error).message, {
                 userId: actor.type?.user?.uuid,
                 username: actor.type?.user?.username,
                 appId: actor.type?.app?.uid,
@@ -235,11 +253,27 @@ export class MeteringService {
                 // Process each usage and aggregate the pathAndAmountMap
                 for ( const usage of usages ) {
                     const { usageType, usageAmount: usageAmountRaw, costOverride: costOverrideRaw } = usage;
-                    const usageAmount =  usageAmountRaw < 0 ? 1 : usageAmountRaw;
-                    const costOverride = costOverrideRaw && costOverrideRaw < 0 ? 1 : costOverrideRaw;
+                    const usageAmount =  (!Number.isFinite(usageAmountRaw) || usageAmountRaw < 0) ? 1 : usageAmountRaw;
+                    const costOverride = !Number.isFinite(costOverrideRaw)
+                        ? undefined
+                        : (costOverrideRaw as number) < 0
+                            ? 1
+                            : costOverrideRaw;
 
                     if ( !usageAmount || !usageType ) {
                         continue; // skip invalid entries
+                    }
+
+                    if ( costOverrideRaw && costOverrideRaw < 0 ) {
+                        this.#alarmService.create(`metering unexpected negative cost access to: ${usageType}`, 'negative cost abuse vector!', {
+                            userId: actor.type?.user?.uuid,
+                            username: actor.type?.user?.username,
+                            appId: actor.type?.app?.uid,
+                            usageType,
+                            usageAmount,
+                            costOverride,
+                            costOverrideRaw,
+                        });
                     }
 
                     const mappedCost = COST_MAPS[usageType as keyof typeof COST_MAPS];
@@ -256,6 +290,7 @@ export class MeteringService {
                             usageType,
                             usageAmount,
                             costOverride,
+                            costOverrideRaw,
                         });
                     }
 
@@ -269,7 +304,7 @@ export class MeteringService {
                 }
 
                 const appId = actor.type?.app?.uid || GLOBAL_APP_KEY;
-                const userId = actor.type?.user.uuid;
+                const userId = actor.type?.user?.uuid!;
 
                 const actorUsageKey = `${METRICS_PREFIX}:actor:${userId}:${currentMonth}`;
                 const actorUsagesPromise = this.#kvStore.incr({
@@ -282,7 +317,7 @@ export class MeteringService {
                     key: puterConsumptionKey,
                     pathAndAmountMap: aggregatedPathAndAmountMap,
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'puterConsumptionKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'puterConsumptionKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const actorAppUsageKey = `${METRICS_PREFIX}:actor:${userId}:app:${appId}:${currentMonth}`;
@@ -290,7 +325,7 @@ export class MeteringService {
                     key: actorAppUsageKey,
                     pathAndAmountMap: aggregatedPathAndAmountMap,
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'actorAppUsageKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'actorAppUsageKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const appUsageKey = this.#generateAppUsageKey(appId, userId, currentMonth);
@@ -298,7 +333,7 @@ export class MeteringService {
                     key: appUsageKey,
                     pathAndAmountMap: aggregatedPathAndAmountMap,
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'appUsageKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'appUsageKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const actorAppTotalsKey = `${METRICS_PREFIX}:actor:${userId}:apps:${currentMonth}`;
@@ -309,7 +344,7 @@ export class MeteringService {
                         [`${appId}.count`]: usages.length,
                     },
                 }).catch((e: Error) => {
-                    console.warn('Failed to increment aux usage data \'actorAppTotalsKey\' with error: ', e);
+                    console.warn(`Failed to increment aux usage data 'actorAppTotalsKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
                 });
 
                 const lastUpdatedKey = `${METRICS_PREFIX}:actor:${userId}:lastUpdated`;
@@ -317,7 +352,7 @@ export class MeteringService {
                     key: lastUpdatedKey,
                     value: Date.now(),
                 }).catch((e: Error) => {
-                    console.warn('Failed to set lastUpdatedKey with error: ', e);
+                    console.warn(`Failed to set lastUpdatedKey with error: ${ e.message}`);
                 });
 
                 // update addon usage if we are over the allowance
@@ -363,7 +398,7 @@ export class MeteringService {
             });
         } catch (e) {
             console.error('Metering: Failed to batch increment usage for actor', actor, 'usages', usages, e);
-            this.#alarmService.create(`metering service error for user: ${ actor.type?.user?.username} app: ${ actor.type.app.uid}`, (e as Error).message, {
+            this.#alarmService.create(`metering service error for user: ${ actor.type?.user?.username} app: ${ actor.type.app?.uid}`, (e as Error).message, {
                 userId: actor.type?.user?.uuid,
                 username: actor.type?.user?.username,
                 appId: actor.type?.app?.uid,
@@ -460,7 +495,7 @@ export class MeteringService {
                 key: puterConsumptionKey,
                 pathAndAmountMap,
             }).catch((e: Error) => {
-                console.warn('Failed to increment aux usage data \'puterConsumptionKey\' with error: ', e);
+                console.warn(`Failed to increment aux usage data 'puterConsumptionKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
             });
 
             const actorAppUsageKey = `${METRICS_PREFIX}:actor:${userId}:app:${appId}:${currentMonth}`;
@@ -468,7 +503,7 @@ export class MeteringService {
                 key: actorAppUsageKey,
                 pathAndAmountMap,
             }).catch((e: Error) => {
-                console.warn('Failed to increment aux usage data \'actorAppUsageKey\' with error: ', e);
+                console.warn(`Failed to increment aux usage data 'actorAppUsageKey' with error: ${ e.message} for userId: ${userId} appId: ${appId}`);
             });
 
             const actorAppTotalsKey = `${METRICS_PREFIX}:actor:${userId}:apps:${currentMonth}`;
@@ -550,7 +585,7 @@ export class MeteringService {
 
     async getActorSubscription (actor: Actor): Promise<(typeof SUB_POLICIES)[number]> {
         // TODO DS: maybe allow non-user actors to have subscriptions eventually
-        if ( ! actor.type?.user.uuid ) {
+        if ( ! actor.type?.user?.uuid ) {
             throw new Error('Actor must be a user to get policy');
         }
 
@@ -648,35 +683,37 @@ export class MeteringService {
     }
 
     async #checkRateOfChange () {
-        const globalUsage = await this.getGlobalUsage();
         const now = Date.now();
         const lastChange = await this.#superUserService.sudo(async () => {
             return this.#kvStore.get({ key: `${METRICS_PREFIX}:lastGlobalUsageCheck` }) as Promise<{ total: number, timestamp: number } | null>;
         });
 
-        const currTotal = globalUsage.total;
+        if ( !lastChange || (now - lastChange.timestamp) > 14 * 60 * 1000 ) {
+            // only checked if more than 14 minutes from last check
+            const globalUsage = await this.getGlobalUsage();
+            const currTotal = globalUsage.total;
 
-        if ( lastChange ) {
-            const timeDelta = now - lastChange.timestamp;
-            const usageDelta = currTotal - lastChange.total;
-            const usagePerMinute = (usageDelta / (timeDelta / 60000));
+            if ( lastChange ) {
+                const timeDelta = now - lastChange.timestamp;
+                const usageDelta = currTotal - lastChange.total;
+                const usagePerMinute = (usageDelta / (timeDelta / 60000));
 
-            if ( usagePerMinute > MeteringService.MAX_GLOBAL_USAGE_PER_MINUTE ) {
-                this.#alarmService.create('metering:excessiveGlobalUsageRate', `Global usage rate is excessive: ${usagePerMinute} micro-cents per minute`, {
-                    usagePerMinute,
-                    maxAllowedPerMinute: MeteringService.MAX_GLOBAL_USAGE_PER_MINUTE,
-                });
+                if ( usagePerMinute > MeteringService.MAX_GLOBAL_USAGE_PER_MINUTE ) {
+                    this.#alarmService.create('metering:excessiveGlobalUsageRate', `Global usage rate is excessive: ${usagePerMinute} micro-cents per minute`, {
+                        usagePerMinute,
+                        maxAllowedPerMinute: MeteringService.MAX_GLOBAL_USAGE_PER_MINUTE,
+                    });
+                }
             }
-        }
-        await this.#superUserService.sudo(async () => {
-            await this.#kvStore.set({
-                key: `${METRICS_PREFIX}:lastGlobalUsageCheck`,
-                value: {
-                    total: currTotal,
-                    timestamp: now,
-                },
+            await this.#superUserService.sudo(async () => {
+                await this.#kvStore.set({
+                    key: `${METRICS_PREFIX}:lastGlobalUsageCheck`,
+                    value: {
+                        total: currTotal,
+                        timestamp: now,
+                    },
+                });
             });
-        });
-
+        }
     }
 }

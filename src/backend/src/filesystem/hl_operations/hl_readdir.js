@@ -18,7 +18,6 @@
  */
 const APIError = require('../../api/APIError');
 const { Context } = require('../../util/context');
-const { stream_to_buffer } = require('../../util/streamutil');
 const { get_apps, suggestedAppsForFsEntries } = require('../../helpers');
 const { ECMAP } = require('../ECMAP');
 const { TYPE_DIRECTORY, TYPE_SYMLINK } = require('../FSNodeContext');
@@ -67,11 +66,13 @@ class HLReadDir extends HLFilesystemOperation {
 
         let children;
 
-        this.log.debug('READDIR',
-                        {
-                            userdir: await subject.isUserDirectory(),
-                            namediff: await subject.get('name') !== user.username,
-                        });
+        this.log.debug(
+            'READDIR',
+            {
+                userdir: await subject.isUserDirectory(),
+                namediff: await subject.get('name') !== user.username,
+            },
+        );
         if ( subject.isRoot ) {
             const ll_listusers = new LLListUsers();
             children = await ll_listusers.run(this.values);
@@ -124,68 +125,81 @@ class HLReadDir extends HLFilesystemOperation {
         }
 
         if ( ! no_subdomains ) {
-            await this.#batchFetchSubdomains(children, user);
+            // await this.#batchFetchSubdomains(children, user);
+            await this.#applySubdomains(children);
         }
 
         return Promise.all(children.map(async child => {
             const entry = await child.getSafeEntry();
             if ( !no_thumbs && entry.associated_app ) {
                 const svc_appIcon = this.context.get('services').get('app-icon');
-                const icon_result = await svc_appIcon.get_icon_stream({
-                    app_icon: entry.associated_app.icon,
-                    app_uid: entry.associated_app.uid ?? entry.associated_app.uuid,
+                const iconPath = svc_appIcon.getAppIconPath({
+                    appUid: entry.associated_app.uid ?? entry.associated_app.uuid,
                     size: 64,
                 });
-
-                if ( icon_result.data_url ) {
-                    entry.associated_app.icon = icon_result.data_url;
-                } else {
-                    try {
-                        const buffer = await stream_to_buffer(icon_result.stream);
-                        const resp_data_url = `data:${icon_result.mime};base64,${buffer.toString('base64')}`;
-                        entry.associated_app.icon = resp_data_url;
-                    } catch (e) {
-                        const svc_error = this.context.get('services').get('error-service');
-                        svc_error.report('hl_readdir:icon-stream', {
-                            source: e,
-                        });
-                    }
+                if ( iconPath ) {
+                    entry.associated_app.icon = iconPath;
                 }
             }
             return entry;
         }));
     }
 
+    async #applySubdomains (children) {
+        for ( const child of children ) {
+            if ( ! child.subdomains ) return;
+            if ( child.subdomains.length > 0 ) child.has_website = true;
+            for ( const subdomain of child.subdomains ) {
+                subdomain.address =
+                    `${config.protocol}://${subdomain.subdomain}.puter.site`;
+            }
+        }
+    }
+
     async #batchFetchSubdomains (children, user) {
-        const dirChildren = [];
+        const childIds = [];
         const childById = new Map();
 
         for ( const child of children ) {
             const entry = child.entry;
-            if ( ! entry?.is_dir ) continue;
+            if ( ! entry ) continue;
             entry.subdomains = [];
+            entry.workers = [];
             if ( entry.id == null ) continue;
-            dirChildren.push(entry.id);
+            childIds.push(entry.id);
             childById.set(entry.id, child);
         }
 
-        if ( dirChildren.length === 0 ) return;
+        if ( childIds.length === 0 ) return;
 
-        const placeholders = dirChildren.map(() => '?').join(',');
+        const placeholders = childIds.map(() => '?').join(',');
         const db = this.context.get('services').get('database').get(DB_READ, 'filesystem');
-        const rows = await db.read(`SELECT root_dir_id, subdomain, uuid
+        const rows = await db.read(
+            `SELECT root_dir_id, subdomain, uuid
              FROM subdomains
              WHERE root_dir_id IN (${placeholders}) AND user_id = ?`,
-        [...dirChildren, user.id]);
+            [...childIds, user.id],
+        );
 
         for ( const row of rows ) {
             const child = childById.get(row.root_dir_id);
             if ( ! child ) continue;
-            child.entry.subdomains.push({
-                subdomain: row.subdomain,
-                address: `${config.protocol }://${ row.subdomain }.puter.site`,
-                uuid: row.uuid,
-            });
+
+            if ( child.entry.is_dir ) {
+                child.entry.subdomains.push({
+                    subdomain: row.subdomain,
+                    address: `${config.protocol }://${ row.subdomain }.puter.site`,
+                    uuid: row.uuid,
+                });
+            } else {
+                const workerName = row.subdomain.split('.').pop();
+                child.entry.workers.push({
+                    subdomain: workerName,
+                    address: `https://${ workerName }.puter.work`,
+                    uuid: row.uuid,
+                });
+            }
+
             child.entry.has_website = true;
         }
     }

@@ -20,9 +20,11 @@ const { origin_from_url } = require('../../util/urlutil');
 const { DB_READ } = require('../../services/database/consts');
 const BaseService = require('../../services/BaseService');
 const { redisClient } = require('../../clients/redis/redisSingleton');
-
-// Currently leaks memory (not sure why yet, but icons are a factor)
-const ENABLE_REFRESH_APP_CACHE = false;
+const { deleteRedisKeys } = require('../../clients/redis/deleteRedisKeys.js');
+const { setRedisCacheValue } = require('../../clients/redis/cacheUpdate.js');
+const { AppRedisCacheSpace } = require('./AppRedisCacheSpace.js');
+const APP_UID_ALIAS_KEY_PREFIX = 'app:canonicalUidAlias';
+const APP_UID_ALIAS_REVERSE_KEY_PREFIX = 'app:canonicalUidAliasReverse';
 
 /**
 * @class AppInformationService
@@ -31,16 +33,13 @@ const ENABLE_REFRESH_APP_CACHE = false;
 * including caching, statistical data, and tags for applications within the Puter ecosystem.
 * It provides methods for refreshing application data, managing app statistics,
 * and handling tags associated with apps. This service is crucial for maintaining
-* up-to-date information about applications, facilitating features like app listings,
-* recent apps, and tag-based app discovery.
+* up-to-date information about applications, facilitating features like app listings
+* and tag-based app discovery.
 */
 class AppInformationService extends BaseService {
     static LOG_DEBUG = true;
 
     _construct () {
-        this.collections = {};
-        this.collections.recent = [];
-
         this.tags = {};
 
         // MySQL date format mapping for different groupings
@@ -63,36 +62,80 @@ class AppInformationService extends BaseService {
     }
 
     '__on_boot.consolidation' () {
+        const svc_event = this.services.get('event');
+        svc_event.on('app.rename', (_, { app_uid: appUid, old_name: oldName }) => {
+            this.invalidateAppCache({ appUid, oldName }).catch((e) => {
+                this.log.error('failed invalidating app cache after app.rename', { appUid, oldName, error: e });
+            });
+        });
+        svc_event.on('app.changed', (_, { app_uid: appUid, app }) => {
+            this.invalidateAppCache({ appUid, app }).catch((e) => {
+                this.log.error('failed invalidating app cache after app.changed', { appUid, error: e });
+            });
+        });
+
         (async () => {
             try {
-                ENABLE_REFRESH_APP_CACHE && await this._refresh_app_cache();
                 await this._refresh_app_stats();
-                await this._refresh_recent_cache();
             } catch (e) {
                 console.error('Some app cache portion failed to populate:', e);
             }
-            ENABLE_REFRESH_APP_CACHE && setInterval(async () => {
-                try {
-                    await this._refresh_app_cache();
-                } catch (e) {
-                    console.error('App cache failed to update:', e);
-                }
-            }, 30 * 1000);
             setInterval(async () => {
                 try {
                     await this._refresh_app_stats();
                 } catch (e) {
                     console.error('App stats cache failed to update:', e);
                 }
-            }, 15.314 * 60 * 1000);
-            setInterval(async () => {
-                try {
-                    await this._refresh_recent_cache();
-                } catch (e) {
-                    console.error('App stats cache failed to update:', e);
-                }
-            }, 4.271 * 60 * 1000);
+            }, 13.314 * 60 * 1000);
         })();
+    }
+
+    async invalidateAppCache ({ appUid, oldName, app }) {
+        let resolvedApp = app ?? null;
+        if ( !resolvedApp && appUid ) {
+            resolvedApp = await AppRedisCacheSpace.getCachedApp({
+                lookup: 'uid',
+                value: appUid,
+            });
+        }
+        if ( !resolvedApp && appUid ) {
+            const db = this.services.get('database').get(DB_READ, 'apps');
+            resolvedApp = (await db.read(
+                'SELECT id, uid, name FROM apps WHERE uid = ? LIMIT 1',
+                [appUid],
+            ))[0] ?? null;
+        }
+
+        if ( resolvedApp ) {
+            await AppRedisCacheSpace.invalidateCachedApp(resolvedApp, {
+                includeStats: true,
+            });
+        } else if ( appUid ) {
+            await Promise.all([
+                deleteRedisKeys([
+                    AppRedisCacheSpace.key({
+                        lookup: 'uid',
+                        value: appUid,
+                        rawIcon: true,
+                    }),
+                    AppRedisCacheSpace.key({
+                        lookup: 'uid',
+                        value: appUid,
+                        rawIcon: false,
+                    }),
+                ]),
+                AppRedisCacheSpace.invalidateAppStats(appUid),
+            ]);
+        }
+
+        if ( oldName ) {
+            await AppRedisCacheSpace.invalidateCachedAppName(oldName);
+        }
+
+        const svc_event = this.services.get('event');
+        await svc_event.emit('apps.invalidate', {
+            app: resolvedApp ?? app ?? { uid: appUid, name: oldName },
+        });
     }
 
     /**
@@ -123,9 +166,9 @@ class AppInformationService extends BaseService {
 
         // Check cache first if period is 'all' and no grouping is requested
         if ( period === 'all' && !stats_grouping ) {
-            const key_open_count = `apps:open_count:uid:${app_uid}`;
-            const key_user_count = `apps:user_count:uid:${app_uid}`;
-            const key_referral_count = `apps:referral_count:uid:${app_uid}`;
+            const key_open_count = AppRedisCacheSpace.openCountKey(app_uid);
+            const key_user_count = AppRedisCacheSpace.userCountKey(app_uid);
+            const key_referral_count = AppRedisCacheSpace.referralCountKey(app_uid);
 
             const [cached_open_count, cached_user_count, cached_referral_count] = await Promise.all([
                 redisClient.get(key_open_count),
@@ -151,97 +194,97 @@ class AppInformationService extends BaseService {
             const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
             switch ( period ) {
-            case 'today':
-                return {
-                    start: today.getTime(),
-                    end: now.getTime(),
-                };
-            case 'yesterday': {
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                return {
-                    start: yesterday.getTime(),
-                    end: today.getTime() - 1,
-                };
-            }
-            case '7d': {
-                const weekAgo = new Date(now);
-                weekAgo.setDate(weekAgo.getDate() - 7);
-                return {
-                    start: weekAgo.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case '30d': {
-                const monthAgo = new Date(now);
-                monthAgo.setDate(monthAgo.getDate() - 30);
-                return {
-                    start: monthAgo.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case 'this_week': {
-                const firstDayOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
-                return {
-                    start: firstDayOfWeek.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case 'last_week': {
-                const firstDayOfLastWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() - 7);
-                const firstDayOfThisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
-                return {
-                    start: firstDayOfLastWeek.getTime(),
-                    end: firstDayOfThisWeek.getTime() - 1,
-                };
-            }
-            case 'this_month': {
-                const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-                return {
-                    start: firstDayOfMonth.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case 'last_month': {
-                const firstDayOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                const firstDayOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-                return {
-                    start: firstDayOfLastMonth.getTime(),
-                    end: firstDayOfThisMonth.getTime() - 1,
-                };
-            }
-            case 'this_year': {
-                const firstDayOfYear = new Date(now.getFullYear(), 0, 1);
-                return {
-                    start: firstDayOfYear.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case 'last_year': {
-                const firstDayOfLastYear = new Date(now.getFullYear() - 1, 0, 1);
-                const firstDayOfThisYear = new Date(now.getFullYear(), 0, 1);
-                return {
-                    start: firstDayOfLastYear.getTime(),
-                    end: firstDayOfThisYear.getTime() - 1,
-                };
-            }
-            case '12m': {
-                const twelveMonthsAgo = new Date(now);
-                twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-                return {
-                    start: twelveMonthsAgo.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            case 'all':{
-                const start = new Date(app_creation_ts);
-                return {
-                    start: start.getTime(),
-                    end: now.getTime(),
-                };
-            }
-            default:
-                return null;
+                case 'today':
+                    return {
+                        start: today.getTime(),
+                        end: now.getTime(),
+                    };
+                case 'yesterday': {
+                    const yesterday = new Date(today);
+                    yesterday.setDate(yesterday.getDate() - 1);
+                    return {
+                        start: yesterday.getTime(),
+                        end: today.getTime() - 1,
+                    };
+                }
+                case '7d': {
+                    const weekAgo = new Date(now);
+                    weekAgo.setDate(weekAgo.getDate() - 7);
+                    return {
+                        start: weekAgo.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case '30d': {
+                    const monthAgo = new Date(now);
+                    monthAgo.setDate(monthAgo.getDate() - 30);
+                    return {
+                        start: monthAgo.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case 'this_week': {
+                    const firstDayOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+                    return {
+                        start: firstDayOfWeek.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case 'last_week': {
+                    const firstDayOfLastWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() - 7);
+                    const firstDayOfThisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+                    return {
+                        start: firstDayOfLastWeek.getTime(),
+                        end: firstDayOfThisWeek.getTime() - 1,
+                    };
+                }
+                case 'this_month': {
+                    const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+                    return {
+                        start: firstDayOfMonth.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case 'last_month': {
+                    const firstDayOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                    const firstDayOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+                    return {
+                        start: firstDayOfLastMonth.getTime(),
+                        end: firstDayOfThisMonth.getTime() - 1,
+                    };
+                }
+                case 'this_year': {
+                    const firstDayOfYear = new Date(now.getFullYear(), 0, 1);
+                    return {
+                        start: firstDayOfYear.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case 'last_year': {
+                    const firstDayOfLastYear = new Date(now.getFullYear() - 1, 0, 1);
+                    const firstDayOfThisYear = new Date(now.getFullYear(), 0, 1);
+                    return {
+                        start: firstDayOfLastYear.getTime(),
+                        end: firstDayOfThisYear.getTime() - 1,
+                    };
+                }
+                case '12m': {
+                    const twelveMonthsAgo = new Date(now);
+                    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+                    return {
+                        start: twelveMonthsAgo.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                case 'all': {
+                    const start = new Date(app_creation_ts);
+                    return {
+                        start: start.getTime(),
+                        end: now.getTime(),
+                    };
+                }
+                default:
+                    return null;
             }
         };
 
@@ -255,9 +298,11 @@ class AppInformationService extends BaseService {
             }
 
             // Generate all periods for the time range
-            const allPeriods = this.generateAllPeriods(new Date(timeRange.start),
-                            new Date(timeRange.end),
-                            stats_grouping);
+            const allPeriods = this.generateAllPeriods(
+                new Date(timeRange.start),
+                new Date(timeRange.end),
+                stats_grouping,
+            );
 
             if ( global.clickhouseClient ) {
                 const groupByFormat = this.clickhouseGroupByFormats[stats_grouping];
@@ -312,9 +357,11 @@ class AppInformationService extends BaseService {
                 const totalUserCount = processedUserRows.reduce((sum, row) => sum + row.count, 0);
 
                 // Generate all periods and merge with actual data
-                const allPeriods = this.generateAllPeriods(new Date(timeRange.start),
-                                new Date(timeRange.end),
-                                stats_grouping);
+                const allPeriods = this.generateAllPeriods(
+                    new Date(timeRange.start),
+                    new Date(timeRange.end),
+                    stats_grouping,
+                );
 
                 const completeOpenStats = this.mergeWithGeneratedPeriods(processedOpenRows, allPeriods, stats_grouping);
                 const completeUserStats = this.mergeWithGeneratedPeriods(processedUserRows, allPeriods, stats_grouping);
@@ -327,7 +374,7 @@ class AppInformationService extends BaseService {
                         user_count: completeUserStats,
                     },
                     referral_count: period === 'all'
-                        ? parse_cached_int(await redisClient.get(`apps:referral_count:uid:${app_uid}`))
+                        ? parse_cached_int(await redisClient.get(AppRedisCacheSpace.referralCountKey(app_uid)))
                         : null,
                 };
             }
@@ -340,8 +387,7 @@ class AppInformationService extends BaseService {
 
                 const [openResult, userResult] = await Promise.all([
                     db.read(`
-                        SELECT ${
-                            db.case({
+                        SELECT ${db.case({
                                 mysql: `DATE_FORMAT(FROM_UNIXTIME(ts/1000), '${timeFormat}') as period, `,
                                 sqlite: `STRFTIME('%Y-%m-%d %H', datetime(ts/1000, 'unixepoch'), '${timeFormat}') as period, `,
                             })
@@ -354,8 +400,7 @@ class AppInformationService extends BaseService {
                         ORDER BY period
                     `, queryParams),
                     db.read(`
-                        SELECT ${
-                            db.case({
+                        SELECT ${db.case({
                                 mysql: `DATE_FORMAT(FROM_UNIXTIME(ts/1000), '${timeFormat}') as period, `,
                                 sqlite: `STRFTIME('%Y-%m-%d %H', datetime(ts/1000, 'unixepoch'), '${timeFormat}') as period, `,
                             })
@@ -395,7 +440,7 @@ class AppInformationService extends BaseService {
                         user_count: completeUserStats,
                     },
                     referral_count: period === 'all'
-                        ? parse_cached_int(await redisClient.get(`apps:referral_count:uid:${app_uid}`))
+                        ? parse_cached_int(await redisClient.get(AppRedisCacheSpace.referralCountKey(app_uid)))
                         : null,
                 };
             }
@@ -437,17 +482,17 @@ class AppInformationService extends BaseService {
                 open_count: parseInt(openRows[0].open_count),
                 user_count: parseInt(userRows[0].uniqueUsers),
                 referral_count: period === 'all'
-                    ? parse_cached_int(await redisClient.get(`apps:referral_count:uid:${app_uid}`))
+                    ? parse_cached_int(await redisClient.get(AppRedisCacheSpace.referralCountKey(app_uid)))
                     : null,
             };
 
             // Cache the results if period is 'all'
             if ( period === 'all' ) {
-                const key_open_count = `apps:open_count:uid:${app_uid}`;
-                const key_user_count = `apps:user_count:uid:${app_uid}`;
-                await Promise.all([
-                    redisClient.set(key_open_count, results.open_count),
-                    redisClient.set(key_user_count, results.user_count),
+                const key_open_count = AppRedisCacheSpace.openCountKey(app_uid);
+                const key_user_count = AppRedisCacheSpace.userCountKey(app_uid);
+                void Promise.all([
+                    setRedisCacheValue(key_open_count, results.open_count),
+                    setRedisCacheValue(key_user_count, results.user_count),
                 ]);
             }
 
@@ -475,41 +520,21 @@ class AppInformationService extends BaseService {
                 open_count: parseInt(openResult[0].open_count),
                 user_count: parseInt(userResult[0].user_count),
                 referral_count: period === 'all'
-                    ? parse_cached_int(await redisClient.get(`apps:referral_count:uid:${app_uid}`))
+                    ? parse_cached_int(await redisClient.get(AppRedisCacheSpace.referralCountKey(app_uid)))
                     : null,
             };
 
             // Cache the results if period is 'all'
             if ( period === 'all' ) {
-                const key_open_count = `apps:open_count:uid:${app_uid}`;
-                const key_user_count = `apps:user_count:uid:${app_uid}`;
-                await Promise.all([
-                    redisClient.set(key_open_count, results.open_count),
-                    redisClient.set(key_user_count, results.user_count),
+                const key_open_count = AppRedisCacheSpace.openCountKey(app_uid);
+                const key_user_count = AppRedisCacheSpace.userCountKey(app_uid);
+                void Promise.all([
+                    setRedisCacheValue(key_open_count, results.open_count),
+                    setRedisCacheValue(key_user_count, results.user_count),
                 ]);
             }
 
             return results;
-        }
-    }
-
-    /**
-    * Refreshes the application cache by querying the database for all apps and updating the key-value store.
-    *
-    * @async
-    * @returns {Promise<void>} A promise that resolves when the cache refresh operation is complete.
-    */
-    async _refresh_app_cache () {
-        const db = this.services.get('database').get(DB_READ, 'apps');
-
-        let apps = await db.read('SELECT * FROM apps');
-        for ( const app of apps ) {
-            const cached_app = JSON.stringify(app);
-            await Promise.all([
-                redisClient.set(`apps:name:${ app.name}`, cached_app),
-                redisClient.set(`apps:id:${ app.id}`, cached_app),
-                redisClient.set(`apps:uid:${ app.uid}`, cached_app),
-            ]);
         }
     }
 
@@ -527,34 +552,60 @@ class AppInformationService extends BaseService {
 
         const db = this.services.get('database').get(DB_READ, 'apps');
 
-        // Fetch all stats in two aggregate queries instead of per-app queries
-        const [openCounts, userCounts] = await Promise.all([
-            db.read(`
-                SELECT app_uid, COUNT(_id) AS open_count 
-                FROM app_opens 
-                GROUP BY app_uid
-            `),
-            db.read(`
-                SELECT app_uid, COUNT(DISTINCT user_id) AS user_count 
-                FROM app_opens 
-                GROUP BY app_uid
-            `),
-        ]);
+        let openCountMap;
+        let userCountMap;
 
-        // Build maps for quick lookup
-        const openCountMap = new Map(openCounts.map(row => [row.app_uid, row.open_count]));
-        const userCountMap = new Map(userCounts.map(row => [row.app_uid, row.user_count]));
+        if ( global.clickhouseClient ) {
+            const [openResult, userResult] = await Promise.all([
+                global.clickhouseClient.query({
+                    query: `
+                        SELECT app_uid, COUNT(_id) AS open_count
+                        FROM app_opens
+                        GROUP BY app_uid
+                    `,
+                    format: 'JSONEachRow',
+                }),
+                global.clickhouseClient.query({
+                    query: `
+                        SELECT app_uid, COUNT(DISTINCT user_id) AS user_count
+                        FROM app_opens
+                        GROUP BY app_uid
+                    `,
+                    format: 'JSONEachRow',
+                }),
+            ]);
+            const openRows = await openResult.json();
+            const userRows = await userResult.json();
+            openCountMap = new Map(openRows.map(row => [row.app_uid, parseInt(row.open_count, 10)]));
+            userCountMap = new Map(userRows.map(row => [row.app_uid, parseInt(row.user_count, 10)]));
+        } else {
+            const [openCounts, userCounts] = await Promise.all([
+                db.read(`
+                    SELECT app_uid, COUNT(_id) AS open_count 
+                    FROM app_opens 
+                    GROUP BY app_uid
+                `),
+                db.read(`
+                    SELECT app_uid, COUNT(DISTINCT user_id) AS user_count 
+                    FROM app_opens 
+                    GROUP BY app_uid
+                `),
+            ]);
+            openCountMap = new Map(openCounts.map(row => [row.app_uid, row.open_count]));
+            userCountMap = new Map(userCounts.map(row => [row.app_uid, row.user_count]));
+        }
 
-        // Get all app UIDs and update the cache
+        // Get all app UIDs and update the cache (apps list lives in MySQL)
         const apps = await db.read('SELECT uid FROM apps');
 
         for ( const app of apps ) {
-            const key_open_count = `apps:open_count:uid:${app.uid}`;
-            const key_user_count = `apps:user_count:uid:${app.uid}`;
+            const key_open_count = AppRedisCacheSpace.openCountKey(app.uid);
+            const key_user_count = AppRedisCacheSpace.userCountKey(app.uid);
 
-            await Promise.all([
-                redisClient.set(key_open_count, openCountMap.get(app.uid) ?? 0),
-                redisClient.set(key_user_count, userCountMap.get(app.uid) ?? 0),
+            // Background refresh writes should stay local to avoid broadcast churn.
+            void Promise.all([
+                setRedisCacheValue(key_open_count, openCountMap.get(app.uid) ?? 0, { emitEvent: false }),
+                setRedisCacheValue(key_user_count, userCountMap.get(app.uid) ?? 0, { emitEvent: false }),
             ]);
         }
     }
@@ -590,7 +641,7 @@ class AppInformationService extends BaseService {
             try {
                 expected_uid = await svc_auth.app_uid_from_origin(origin);
             } catch (e) {
-            // This happens if the app origin isn't valid
+                // This happens if the app origin isn't valid
                 continue;
             }
             if ( expected_uid !== app.uid ) {
@@ -633,54 +684,13 @@ class AppInformationService extends BaseService {
 
         // Update cache with results
         for ( const app of validApps ) {
-            const key_referral_count = `apps:referral_count:uid:${app.uid}`;
+            const key_referral_count = AppRedisCacheSpace.referralCountKey(app.uid);
             const count = referralMap.get(app.uid) || 0;
-            await redisClient.set(key_referral_count, count);
+            // Background refresh writes should stay local to avoid broadcast churn.
+            await setRedisCacheValue(key_referral_count, count, { emitEvent: false });
         }
 
         this.log.info('DONE refresh app stat referrals');
-    }
-
-    /**
-    * Updates the cache with recently updated apps.
-    *
-    * @description This method refreshes the cache containing the most recently updated applications.
-    *              It fetches all app UIDs, retrieves the corresponding app data, filters for approved apps,
-    *              sorts them by timestamp in descending order, and updates the 'recent' collection with
-    *              the UIDs of the top 50 most recent apps.
-    *
-    * @returns {Promise<void>} Resolves when the cache has been updated.
-    */
-    async _refresh_recent_cache () {
-        const app_keys = [];
-        let cursor = '0';
-        do {
-            // Use SCAN to avoid KEYS, which is often disabled on managed/serverless Redis.
-            const [next_cursor, keys] = await redisClient.scan(cursor,
-                            'MATCH',
-                            'apps:uid:*',
-                            'COUNT',
-                            1000);
-            cursor = next_cursor;
-            if ( keys && keys.length ) app_keys.push(...keys);
-        } while ( cursor !== '0' );
-
-        const apps = (await Promise.all(app_keys.map(async (key) => {
-            const cached_app = await redisClient.get(key);
-            if ( ! cached_app ) return null;
-            try {
-                return JSON.parse(cached_app);
-            } catch (e) {
-                return null;
-            }
-        }))).filter(Boolean);
-
-        const approved_apps = apps.filter(app => app.approved_for_listing);
-        approved_apps.sort((a, b) => {
-            return b.timestamp - a.timestamp;
-        });
-
-        this.collections.recent = approved_apps.map(app => app.uid).slice(0, 50);
     }
 
     /**
@@ -690,51 +700,58 @@ class AppInformationService extends BaseService {
     * - Retrieves the app data from cache or database if not provided.
     * - Deletes the app record from the database.
     * - Removes the app from all relevant caches (by name, id, and uid).
-    * - Removes the app from the recent collection if present.
     * - Removes the app from any associated tags.
     *
     * @param {string} app_uid - The unique identifier of the app to be deleted.
     * @param {Object} [app] - The app object, if already fetched. If not provided, it will be retrieved.
+    * @param {Object} [options] - Optional delete behavior flags.
     * @throws {Error} If the app is not found in either cache or database.
     * @returns {Promise<void>} A promise that resolves when the app has been successfully deleted.
     */
-    async delete_app (app_uid, app) {
+    async delete_app (app_uid, app, options = {}) {
         const db = this.services.get('database').get(DB_READ, 'apps');
 
         if ( ! app ) {
-            const cached_app = await redisClient.get(`apps:uid:${ app_uid}`);
-            if ( cached_app ) {
-                try {
-                    app = JSON.parse(cached_app);
-                } catch (e) {
-                    console.warn(e);
-                    // no-op cache in invalid state
-                }
-            }
+            app = await AppRedisCacheSpace.getCachedApp({
+                lookup: 'uid',
+                value: app_uid,
+            });
         }
         if ( ! app ) {
-            app = (await db.read('SELECT * FROM apps WHERE uid = ?',
-                            [app_uid]))[0];
+            app = (await db.read(
+                'SELECT * FROM apps WHERE uid = ?',
+                [app_uid],
+            ))[0];
         }
 
         if ( ! app ) {
             throw new Error('app not found');
         }
 
-        await db.write('DELETE FROM apps WHERE uid = ? LIMIT 1',
-                        [app_uid]);
+        const associationRows = await db.read(
+            'SELECT type FROM app_filetype_association WHERE app_id = ?',
+            [app.id],
+        );
+
+        await db.write(
+            'DELETE FROM apps WHERE uid = ? LIMIT 1',
+            [app_uid],
+        );
+
+        if ( ! options.preserveCanonicalUidAlias ) {
+            await this.cleanupCanonicalAppUidAliases_(app_uid);
+        }
 
         // remove from caches
-        await Promise.all([
-            redisClient.del(`apps:name:${ app.name}`),
-            redisClient.del(`apps:id:${ app.id}`),
-            redisClient.del(`apps:uid:${ app.uid}`),
-        ]);
-
-        // remove from recent
-        const index = this.collections.recent.indexOf(app_uid);
-        if ( index >= 0 ) {
-            this.collections.recent.splice(index, 1);
+        AppRedisCacheSpace.invalidateCachedApp(app, {
+            includeStats: true,
+        });
+        const associationKeys = associationRows
+            .map(row => String(row.type ?? '').trim().toLowerCase().replace(/^\./, ''))
+            .filter(Boolean)
+            .map(ext => AppRedisCacheSpace.associationAppsKey(ext));
+        if ( associationKeys.length ) {
+            await deleteRedisKeys(associationKeys);
         }
 
         // remove from tags
@@ -750,10 +767,64 @@ class AppInformationService extends BaseService {
         }
 
         const svc_event = this.services.get('event');
-        svc_event.emit('app.changed', {
+        await svc_event.emit('app.changed', {
             app_uid: app.uid,
             action: 'deleted',
+            app,
         });
+    }
+
+    buildCanonicalAppUidAliasKey_ (appUid) {
+        return `${APP_UID_ALIAS_KEY_PREFIX}:${appUid}`;
+    }
+
+    buildCanonicalAppUidAliasReverseKey_ (canonicalAppUid) {
+        return `${APP_UID_ALIAS_REVERSE_KEY_PREFIX}:${canonicalAppUid}`;
+    }
+
+    normalizeCanonicalAliasUidList_ (value) {
+        if ( ! Array.isArray(value) ) return [];
+        const normalizedList = [];
+        const seen = new Set();
+        for ( const item of value ) {
+            if ( typeof item !== 'string' || !item ) continue;
+            if ( seen.has(item) ) continue;
+            seen.add(item);
+            normalizedList.push(item);
+        }
+        return normalizedList;
+    }
+
+    async cleanupCanonicalAppUidAliases_ (appUid) {
+        if ( typeof appUid !== 'string' || !appUid ) return;
+
+        const kvStore = this.services.get('puter-kvstore');
+        const suService = this.services.get('su');
+        if ( !kvStore || typeof kvStore.get !== 'function' || typeof kvStore.del !== 'function' ) return;
+        if ( !suService || typeof suService.sudo !== 'function' ) return;
+
+        const selfAliasKey = this.buildCanonicalAppUidAliasKey_(appUid);
+        const reverseKey = this.buildCanonicalAppUidAliasReverseKey_(appUid);
+
+        try {
+            await suService.sudo(async () => {
+                const reverseValue = await kvStore.get({ key: reverseKey });
+                const reverseAliases = this.normalizeCanonicalAliasUidList_(reverseValue);
+
+                const deleteOps = [
+                    kvStore.del({ key: selfAliasKey }),
+                    kvStore.del({ key: reverseKey }),
+                ];
+                for ( const oldUid of reverseAliases ) {
+                    deleteOps.push(kvStore.del({
+                        key: this.buildCanonicalAppUidAliasKey_(oldUid),
+                    }));
+                }
+                await Promise.all(deleteOps);
+            });
+        } catch {
+            // KV cleanup is best-effort.
+        }
     }
 
     // Helper function to generate array of all periods between start and end dates
@@ -767,29 +838,29 @@ class AppInformationService extends BaseService {
         while ( currentDate <= endDate ) {
             let period;
             switch ( grouping ) {
-            case 'hour':
-                period = `${currentDate.toISOString().slice(0, 13) }:00:00`;
-                currentDate.setHours(currentDate.getHours() + 1);
-                break;
-            case 'day':
-                period = currentDate.toISOString().slice(0, 10);
-                currentDate.setDate(currentDate.getDate() + 1);
-                break;
-            case 'week': {
+                case 'hour':
+                    period = `${currentDate.toISOString().slice(0, 13)}:00:00`;
+                    currentDate.setHours(currentDate.getHours() + 1);
+                    break;
+                case 'day':
+                    period = currentDate.toISOString().slice(0, 10);
+                    currentDate.setDate(currentDate.getDate() + 1);
+                    break;
+                case 'week': {
                 // Get the ISO week number
-                const weekNum = String(this.getWeekNumber(currentDate)).padStart(2, '0');
-                period = `${currentDate.getFullYear()}-${weekNum}`;
-                currentDate.setDate(currentDate.getDate() + 7);
-                break;
-            }
-            case 'month':
-                period = currentDate.toISOString().slice(0, 7);
-                currentDate.setMonth(currentDate.getMonth() + 1);
-                break;
-            case 'year':
-                period = currentDate.getFullYear().toString();
-                currentDate.setFullYear(currentDate.getFullYear() + 1);
-                break;
+                    const weekNum = String(this.getWeekNumber(currentDate)).padStart(2, '0');
+                    period = `${currentDate.getFullYear()}-${weekNum}`;
+                    currentDate.setDate(currentDate.getDate() + 7);
+                    break;
+                }
+                case 'month':
+                    period = currentDate.toISOString().slice(0, 7);
+                    currentDate.setMonth(currentDate.getMonth() + 1);
+                    break;
+                case 'year':
+                    period = currentDate.getFullYear().toString();
+                    currentDate.setFullYear(currentDate.getFullYear() + 1);
+                    break;
             }
             periods.push({ period, count: 0 });
         }
@@ -818,23 +889,23 @@ class AppInformationService extends BaseService {
             // For ClickHouse results, convert the timestamp to match the expected format
             if ( item.period instanceof Date ) {
                 switch ( stats_grouping ) {
-                case 'hour':
-                    period = `${item.period.toISOString().slice(0, 13) }:00:00`;
-                    break;
-                case 'day':
-                    period = item.period.toISOString().slice(0, 10);
-                    break;
-                case 'week': {
-                    const weekNum = String(this.getWeekNumber(item.period)).padStart(2, '0');
-                    period = `${item.period.getFullYear()}-${weekNum}`;
-                    break;
-                }
-                case 'month':
-                    period = item.period.toISOString().slice(0, 7);
-                    break;
-                case 'year':
-                    period = item.period.getFullYear().toString();
-                    break;
+                    case 'hour':
+                        period = `${item.period.toISOString().slice(0, 13)}:00:00`;
+                        break;
+                    case 'day':
+                        period = item.period.toISOString().slice(0, 10);
+                        break;
+                    case 'week': {
+                        const weekNum = String(this.getWeekNumber(item.period)).padStart(2, '0');
+                        period = `${item.period.getFullYear()}-${weekNum}`;
+                        break;
+                    }
+                    case 'month':
+                        period = item.period.toISOString().slice(0, 7);
+                        break;
+                    case 'year':
+                        period = item.period.getFullYear().toString();
+                        break;
                 }
             }
             return [period, parseInt(item.count)];

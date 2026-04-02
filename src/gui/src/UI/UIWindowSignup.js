@@ -17,10 +17,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import UIWindow from './UIWindow.js';
-import UIWindowLogin from './UIWindowLogin.js';
-import UIWindowEmailConfirmationRequired from './UIWindowEmailConfirmationRequired.js';
 import check_password_strength from '../helpers/check_password_strength.js';
+import UIWindow from './UIWindow.js';
+import UIWindowEmailConfirmationRequired from './UIWindowEmailConfirmationRequired.js';
+import UIWindowLogin from './UIWindowLogin.js';
 
 function UIWindowSignup (options) {
     options = options ?? {};
@@ -96,6 +96,12 @@ function UIWindowSignup (options) {
         // Create Account
         h += `<button class="signup-btn button button-primary button-block button-normal">${i18n('create_free_account')}</button>`;
         h += '</form>';
+        h += '<div class="oidc-providers-wrapper" style="display:none; padding: 10px 0;">';
+        h += `<div style="text-align:center; margin: 10px 0; font-size:13px;">${ i18n('or') }</div>`;
+        h += `<button type="button" class="oidc-google-btn button button-block button-normal" style="display:flex; align-items:center; justify-content:center; gap:8px;"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-google" viewBox="0 0 16 16">
+  <path d="M15.545 6.558a9.4 9.4 0 0 1 .139 1.626c0 2.434-.87 4.492-2.384 5.885h.002C11.978 15.292 10.158 16 8 16A8 8 0 1 1 8 0a7.7 7.7 0 0 1 5.352 2.082l-2.284 2.284A4.35 4.35 0 0 0 8 3.166c-2.087 0-3.86 1.408-4.492 3.304a4.8 4.8 0 0 0 0 3.063h.003c.635 1.893 2.405 3.301 4.492 3.301 1.078 0 2.004-.276 2.722-.764h-.003a3.7 3.7 0 0 0 1.599-2.431H8v-3.08z"/>
+</svg>${i18n('sign_up_with_google')}</button>`;
+        h += '</div>';
         h += '</div>';
         // login link
         // create account link
@@ -126,7 +132,13 @@ function UIWindowSignup (options) {
             dominant: true,
             center: true,
             onAppend: function (el_window) {
-                $(el_window).find('.username').get(0).focus({ preventScroll: true });
+                if ( options.authError ) {
+                    $(el_window).find('.signup-error-msg').html(options.authError).fadeIn();
+                }
+                if ( ! window.disable_signup_autofocus )
+                {
+                    $(el_window).find('.username').get(0).focus({ preventScroll: true });
+                }
 
                 // Initialize Turnstile widget with callback to capture token
                 const initTurnstile = () => {
@@ -155,6 +167,28 @@ function UIWindowSignup (options) {
                 };
 
                 initTurnstile();
+
+                (async () => {
+                    try {
+                        const res = await fetch(`${window.api_origin}/auth/oidc/providers`);
+                        if ( ! res.ok ) return;
+                        const data = await res.json();
+                        if ( data.providers && data.providers.includes('google') ) {
+                            $(el_window).find('.oidc-providers-wrapper').show();
+                            $(el_window).find('.oidc-google-btn').on('click', function () {
+                                let url = `${window.gui_origin}/auth/oidc/google/start?flow=signup`;
+                                if ( window.embedded_in_popup && window.url_query_params?.get('msg_id') ) {
+                                    url += `&embedded_in_popup=true&msg_id=${encodeURIComponent(window.url_query_params.get('msg_id'))}`;
+                                    if ( window.openerOrigin ) {
+                                        url += `&opener_origin=${encodeURIComponent(window.openerOrigin)}`;
+                                    }
+                                }
+                                window.location.href = url;
+                            });
+                        }
+                    } catch (_) {
+                    }
+                })();
             },
             window_class: 'window-signup',
             window_css: {
@@ -303,17 +337,22 @@ function UIWindowSignup (options) {
                 contentType: 'application/json',
                 data: JSON.stringify(requestData),
                 success: async function (data) {
-                    window.update_auth_data(data.token, data.user);
+                    await window.update_auth_data(data.token, data.user);
 
                     //send out the login event
                     if ( options.reload_on_success ) {
                         window.onbeforeunload = null;
-                        // Replace with a clean URL to prevent sensitive data leakage
-                        const cleanUrl = options.redirect_url || window.location.origin + window.location.pathname;
-                        window.location.replace(cleanUrl);
-                    } else if ( options.send_confirmation_code ) {
+                        // either options.redirect_url or the current page
+                        const redirectUrl = options.redirect_url || window.location.href;
+                        window.location.replace(redirectUrl);
+                    } else if ( options.send_confirmation_code || data.user?.requires_email_confirmation ) {
                         $(el_window).close();
-                        let is_verified = await UIWindowEmailConfirmationRequired({ stay_on_top: true, has_head: true });
+                        let is_verified = await UIWindowEmailConfirmationRequired({
+                            stay_on_top: true,
+                            has_head: true,
+                            reload_on_success: options.reload_on_success,
+                            window_options: options.window_options ?? {},
+                        });
                         resolve(is_verified);
                     } else {
                         resolve(true);
@@ -380,8 +419,9 @@ function UIWindowSignup (options) {
             let isPasswordVisible = inputField.attr('type') === 'text';
             inputField.attr('type', isPasswordVisible ? 'password' : 'text');
             $(this).find('.toggle-show-password-icon').attr(
-                            'src',
-                            isPasswordVisible ? window.icons['eye-open.svg'] : window.icons['eye-closed.svg']);
+                'src',
+                isPasswordVisible ? window.icons['eye-open.svg'] : window.icons['eye-closed.svg'],
+            );
         });
 
         //remove login window

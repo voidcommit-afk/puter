@@ -176,8 +176,6 @@ async function secureAxiosRequest (axios, url, options = {}) {
     // Validate URL doesn't contain IP addresses
     validateUrlNoIP(url);
 
-    console.log(`[securehttp] Making secure request to ${url}`);
-
     // Create secure agents
     const { httpAgent, httpsAgent } = createSecureAgents();
 
@@ -187,13 +185,22 @@ async function secureAxiosRequest (axios, url, options = {}) {
         maxRedirects: 0, // Disable redirects - axios will return 3xx responses without following
         httpAgent,
         httpsAgent,
-        validateStatus: (status) => {
+        validateStatus: (_status) => {
             // Accept all status codes so we can check for redirects
             return true;
         },
     };
 
     try {
+        const parsedUrl = new URL(url);
+        if ( parsedUrl.protocol !== 'data:' && globalThis.global_config.services.secureCorsProxy.url ) {
+            url = globalThis.global_config.services.secureCorsProxy.url + url;
+            if ( ! secureOptions.headers ) {
+                secureOptions.headers = {};
+            }
+            secureOptions.headers['x-cors-proxy-auth-secret'] = globalThis.global_config.services.secureCorsProxy.secret;
+
+        }
         const response = await axios.get(url, secureOptions);
 
         // Check if the response is a redirect (maxRedirects: 0 means axios returns but doesn't follow)
@@ -205,7 +212,15 @@ async function secureAxiosRequest (axios, url, options = {}) {
             });
         }
 
-        console.log(`[securehttp] Successfully fetched ${url} (status: ${response.status})`);
+        // Log different information based on URL type
+
+        if ( parsedUrl.protocol === 'data:' ) {
+            // Extract data format from data URL
+            const dataFormat = url.split(',')[0].split(':')[1] || 'unknown format';
+            console.log(`[securehttp] Successfully processed data URL with format: ${dataFormat}`);
+        } else {
+            console.log(`[securehttp] Successfully fetched ${url} (status: ${response.status})`);
+        }
         return response;
     } catch (e) {
         // Re-throw APIError if it's already one (e.g., from validateUrlNoIP or redirect check)
@@ -213,8 +228,15 @@ async function secureAxiosRequest (axios, url, options = {}) {
             throw e;
         }
 
-        // Log the full error for debugging
-        console.error(`[securehttp] Request failed for ${url}:`, e);
+        // Log different information based on URL type
+        const parsedUrl = new URL(url);
+        if ( parsedUrl.protocol === 'data:' ) {
+            // Extract data format from data URL
+            const dataFormat = url.split(',')[0].split(':')[1] || 'unknown format';
+            console.error(`[securehttp] Request failed for data URL with format: ${dataFormat}:`, e);
+        } else {
+            console.error(`[securehttp] Request failed for ${url}:`, e);
+        }
 
         // Handle redirect errors in catch block (in case axios throws for redirects)
         if ( e.response && (e.response.status === 301 || e.response.status === 302 ||

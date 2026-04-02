@@ -19,7 +19,7 @@
 const seedrandom = require('seedrandom');
 const { generate_random_code } = require('../util/identifier');
 const { Context } = require('../util/context');
-const { get_user } = require('../helpers');
+const { get_user, invalidate_cached_user_by_id } = require('../helpers');
 const { DB_WRITE } = require('./database/consts');
 const BaseService = require('./BaseService');
 const { UserIDNotifSelector } = require('./NotificationService');
@@ -38,6 +38,8 @@ class ReferralCodeService extends BaseService {
         this.REFERRAL_INCREASE_LEFT = 1 * 1024 * 1024 * 1024; // 1 GB
         this.REFERRAL_INCREASE_RIGHT = 1 * 1024 * 1024 * 1024; // 1 GB
         this.STORAGE_INCREASE_STRING = '1 GB';
+        this.MAX_REFERRALS_PER_MONTH = 20;
+        this.MONTHLY_REFERRAL_KEY_PREFIX = 'referral:monthly';
     }
 
     /**
@@ -52,7 +54,7 @@ class ReferralCodeService extends BaseService {
     async _init () {
         const svc_event = this.services.get('event');
         svc_event.on('user.email-confirmed', async (_, { user_uid }) => {
-            const user = await get_user({ uuid: user_uid });
+            const user = await this.getUser({ uuid: user_uid });
             await this.on_verified(user);
         });
     }
@@ -95,9 +97,10 @@ class ReferralCodeService extends BaseService {
                 referral_code = generate_random_code(8, { rng });
             }
             try {
-                db.write(`
+                await db.write(`
                     UPDATE user SET referral_code=? WHERE id=?
                 `, [referral_code, user.id]);
+                invalidate_cached_user_by_id(user.id);
                 return referral_code;
             } catch (e) {
                 last_error = e;
@@ -124,7 +127,15 @@ class ReferralCodeService extends BaseService {
     async on_verified (user) {
         if ( ! user.referred_by ) return;
 
-        const referred_by = await get_user({ id: user.referred_by });
+        const referred_by = await this.getUser({ id: user.referred_by });
+        const monthlyReferralCount = await this.consumeMonthlyReferralSlot(referred_by.id);
+        if ( monthlyReferralCount > this.MAX_REFERRALS_PER_MONTH ) {
+            this.log.info(
+                `skipping referral rewards for user ${referred_by.id}: ` +
+                `monthly limit reached (${monthlyReferralCount}/${this.MAX_REFERRALS_PER_MONTH})`,
+            );
+            return;
+        }
 
         // since this event handler is only called when the user is verified,
         // we can assume that the `user` is already verified.
@@ -133,23 +144,30 @@ class ReferralCodeService extends BaseService {
 
         // TODO: rename 'sizeService' to 'storage-capacity'
         const svc_size = Context.get('services').get('sizeService');
-        /** @type {import('./MeteringService/MeteringService').MeteringService} */
         const meteringService = this.services.get('meteringService');
-        await svc_size.add_storage(user,
-                        this.REFERRAL_INCREASE_RIGHT,
-                        `user ${user.id} used referral code of user ${referred_by.id}`,
-                        {
-                            field_a: referred_by.referral_code,
-                            field_b: 'REFER_R',
-                        });
+
+        // For user that got referred to
+        await svc_size.add_storage(
+            user,
+            this.REFERRAL_INCREASE_RIGHT,
+            `user ${user.id} used referral code of user ${referred_by.id}`,
+            {
+                field_a: referred_by.referral_code,
+                field_b: 'REFER_R',
+            },
+        );
         await meteringService.updateAddonCredit(user.uuid, 25 * 1_000_000); // give them 25 cents
-        await svc_size.add_storage(referred_by,
-                        this.REFERRAL_INCREASE_LEFT,
-                        `user ${referred_by.id} referred user ${user.id}`,
-                        {
-                            field_a: referred_by.referral_code,
-                            field_b: 'REFER_L',
-                        });
+
+        // For user who referred
+        await svc_size.add_storage(
+            referred_by,
+            this.REFERRAL_INCREASE_LEFT,
+            `user ${referred_by.id} referred user ${user.id}`,
+            {
+                field_a: referred_by.referral_code,
+                field_b: 'REFER_L',
+            },
+        );
         await meteringService.updateAddonCredit(referred_by.uuid, 25 * 1_000_000); // give them 25 cents
 
         const svc_email = Context.get('services').get('email');
@@ -169,6 +187,46 @@ class ReferralCodeService extends BaseService {
                 referred_username: user.username,
             },
         });
+    }
+
+    getMonthlyReferralKey (referredByUserId, nowMs = Date.now()) {
+        const month = new Date(nowMs).toISOString().slice(0, 7);
+        return `${this.MONTHLY_REFERRAL_KEY_PREFIX}:user:${referredByUserId}:month:${month}`;
+    }
+
+    getNextMonthTimestamp (nowMs = Date.now()) {
+        const now = new Date(nowMs);
+        return Math.floor(Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth() + 1,
+            1,
+            0,
+            0,
+            0,
+        ) / 1000);
+    }
+
+    async consumeMonthlyReferralSlot (referredByUserId) {
+        const su = this.services.get('su');
+        const kvStore = this.services.get('puter-kvstore');
+        const key = this.getMonthlyReferralKey(referredByUserId);
+        const expiryTimestamp = this.getNextMonthTimestamp();
+
+        return await su.sudo(async () => {
+            const counter = await kvStore.incr({
+                key,
+                pathAndAmountMap: { total: 1 },
+            });
+            await kvStore.expireAt({
+                key,
+                timestamp: expiryTimestamp,
+            });
+            return Number(counter?.total ?? 0);
+        });
+    }
+
+    async getUser (query) {
+        return await get_user(query);
     }
 }
 

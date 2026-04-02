@@ -23,6 +23,7 @@ const BaseService = require('../../services/BaseService');
  * @typedef {Object} KVStoreInterface
  * @property {function(KVStoreGetParams): Promise<unknown>} get - Retrieve the value(s) for the given key(s).
  * @property {function(KVStoreSetParams): Promise<void>} set - Set a value for a key, with optional expiration.
+ * @property {function(KVStoreBatchPutParams): Promise<void>} batchPut - Set many key-value entries in one call.
  * @property {function(KVStoreDelParams): Promise<void>} del - Delete a value by key.
  * @property {function(KVStoreListParams): Promise<KVStoreListResult|Array>} list - List key-value pairs, optionally with pagination.
  * @property {function(): Promise<void>} flush - Delete all key-value pairs in the store.
@@ -41,6 +42,9 @@ const BaseService = require('../../services/BaseService');
  * @property {string} key - The key to set.
  * @property {*} value - The value to store.
  * @property {number} [expireAt] - Optional UNIX timestamp (seconds) when the key should expire.
+ *
+ * @typedef {Object} KVStoreBatchPutParams
+ * @property {{key: string, value: *, expireAt?: number}[]} items - Key/value pairs to store.
  *
  * @typedef {Object} KVStoreDelParams
  * @property {string} key - The key to delete.
@@ -87,7 +91,7 @@ class KVStoreInterfaceService extends BaseService {
     * Service class for managing KVStore interface registrations.
     * Extends the base service to provide key-value store interface management.
     */
-    async ['__on_driver.register.interfaces'] () {
+    async '__on_driver.register.interfaces' () {
         const svc_registry = this.services.get('registry');
         const col_interfaces = svc_registry.get('interfaces');
 
@@ -99,6 +103,7 @@ class KVStoreInterfaceService extends BaseService {
                     description: 'Get a value by key.',
                     parameters: {
                         key: { type: 'json', required: true },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json' },
                 },
@@ -108,6 +113,16 @@ class KVStoreInterfaceService extends BaseService {
                         key: { type: 'string', required: true },
                         value: { type: 'json' },
                         expireAt: { type: 'number' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
+
+                    },
+                    result: { type: 'void' },
+                },
+                batchPut: {
+                    description: 'Set many values by key in a single call.',
+                    parameters: {
+                        items: { type: 'json', required: true },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'void' },
                 },
@@ -115,6 +130,7 @@ class KVStoreInterfaceService extends BaseService {
                     description: 'Delete a value by key.',
                     parameters: {
                         key: { type: 'string' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'void' },
                 },
@@ -133,12 +149,13 @@ class KVStoreInterfaceService extends BaseService {
                         cursor: {
                             type: 'string',
                         },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json' },
                 },
                 flush: {
                     description: 'Delete all key-value pairs.',
-                    parameters: {},
+                    parameters: { optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' } },
                     result: { type: 'void' },
                 },
                 update: {
@@ -147,6 +164,7 @@ class KVStoreInterfaceService extends BaseService {
                         key: { type: 'string', required: true },
                         pathAndValueMap: { type: 'json', required: true, description: 'map of period-joined path to value' },
                         ttl: { type: 'number', description: 'optional TTL in seconds for the whole object' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json', description: 'The updated value' },
                 },
@@ -155,6 +173,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         pathAndValueMap: { type: 'json', required: true, description: 'map of period-joined path to value to append' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json', description: 'The updated value' },
                 },
@@ -163,6 +182,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         paths: { type: 'json', required: true, description: 'list of period-joined paths to remove' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json', description: 'The updated value' },
                 },
@@ -171,6 +191,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         pathAndAmountMap: { type: 'json', required: true, description: 'map of period-joined path to amount to increment by' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
                     },
                     result: { type: 'json', description: 'The updated value' },
                 },
@@ -179,6 +200,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         pathAndAmountMap: { type: 'json', required: true, description: 'map of period-joined path to amount to increment by' },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
 
                     },
                     result: { type: 'json', description: 'The updated value' },
@@ -188,6 +210,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         timestamp: { type: 'number', required: true },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
 
                     },
                     result: { type: 'number' },
@@ -197,6 +220,7 @@ class KVStoreInterfaceService extends BaseService {
                     parameters: {
                         key: { type: 'string', required: true },
                         ttl: { type: 'number', required: true },
+                        optConfig: { type: 'json', description: 'additional options for get, e.g. { appUuid: "someId" }' },
 
                     },
                     result: { type: 'number' },

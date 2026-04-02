@@ -48,15 +48,17 @@ class Auth {
         return new Promise((resolve, reject) => {
             let msg_id = this.#messageID++;
             let w = 600;
-            let h = 600;
+            let h = 700;
             let title = 'Puter';
             var left = (screen.width / 2) - (w / 2);
             var top = (screen.height / 2) - (h / 2);
 
             // Store reference to the popup window
-            const popup = window.open(`${puter.defaultGUIOrigin}/action/sign-in?embedded_in_popup=true&msg_id=${msg_id}${window.crossOriginIsolated ? '&cross_origin_isolated=true' : ''}${options.attempt_temp_user_creation ? '&attempt_temp_user_creation=true' : ''}`,
-                            title,
-                            `toolbar=no, location=no, directories=no, status=no, menubar=no, scrollbars=no, resizable=no, copyhistory=no, width=${w}, height=${h}, top=${top}, left=${left}`);
+            const popup = window.open(
+                `${puter.defaultGUIOrigin}/action/sign-in?embedded_in_popup=true&msg_id=${msg_id}${window.crossOriginIsolated ? '&cross_origin_isolated=true' : ''}${options.attempt_temp_user_creation ? '&attempt_temp_user_creation=true' : ''}`,
+                title,
+                `toolbar=no, location=no, directories=no, status=no, menubar=no, scrollbars=no, resizable=no, copyhistory=no, width=${w}, height=${h}, top=${top}, left=${left}`,
+            );
 
             // Set up interval to check if popup was closed
             const checkClosed = setInterval(() => {
@@ -108,6 +110,14 @@ class Auth {
     };
 
     getUser = function (...args) {
+        if ( ! puter.authToken ) {
+            // Fake the server response for backwards compatibility
+            // We already know this will fail
+            throw {
+                'status': 401,
+                'message': 'Unauthorized',
+            };
+        }
         let options;
 
         // If first argument is an object, it's the options
@@ -136,6 +146,15 @@ class Auth {
     };
 
     async whoami () {
+        if ( ! this.authToken ) {
+            // Fake the server response for backwards compatibility
+            // We already know this will fail
+            throw {
+                'status': 401,
+                'message': 'Unauthorized',
+            };
+        }
+
         try {
             const resp = await fetch(`${this.APIOrigin}/whoami`, {
                 headers: {
